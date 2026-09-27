@@ -6,7 +6,8 @@ import {
 } from "../../src/lease-lifecycle.js";
 
 const SANDBOX_GROUP = "agents.x-k8s.io";
-const SANDBOX_VERSION = "v1alpha1";
+const SANDBOX_VERSION = "v1beta1";
+const SANDBOX_API_VERSION = `${SANDBOX_GROUP}/${SANDBOX_VERSION}`;
 const SANDBOX_PLURAL = "sandboxes";
 
 function notFound(): Error {
@@ -15,11 +16,41 @@ function notFound(): Error {
 
 function readySandboxCr(podName?: string): Record<string, unknown> {
   return {
-    metadata: { uid: "uid-1" },
-    status: {
-      conditions: [{ type: "Ready", status: "True" }],
-      ...(podName ? { podName } : {}),
+    metadata: {
+      uid: "uid-1",
+      generation: 1,
+      ...(podName ? { annotations: { "agents.x-k8s.io/pod-name": podName } } : {}),
     },
+    status: {
+      conditions: [
+        {
+          type: "Ready",
+          status: "True",
+          reason: "DependenciesReady",
+          observedGeneration: 1,
+        },
+      ],
+      selector: "agents.x-k8s.io/sandbox-name-hash=1a2b3c",
+    },
+  };
+}
+
+function sandboxOwnedPod(name: string, extraMetadata: Record<string, unknown> = {}) {
+  return {
+    metadata: {
+      name,
+      ...extraMetadata,
+      ownerReferences: [
+        {
+          apiVersion: SANDBOX_API_VERSION,
+          kind: "Sandbox",
+          name: "pc-abc",
+          uid: "uid-1",
+          controller: true,
+        },
+      ],
+    },
+    status: { phase: "Running" },
   };
 }
 
@@ -42,10 +73,7 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
         getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
       },
       core: {
-        readNamespacedPod: vi.fn().mockResolvedValue({
-          metadata: {},
-          status: { phase: "Running" },
-        }),
+        readNamespacedPod: vi.fn().mockResolvedValue(sandboxOwnedPod("pc-abc-pod")),
       },
     };
     const result = await checkLeaseResumable(clients as never, {
@@ -82,11 +110,16 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
     const clients = {
       custom: {
         getNamespacedCustomObject: vi.fn().mockResolvedValue({
-          metadata: { uid: "uid-1" },
+          metadata: { uid: "uid-1", generation: 1 },
           status: {
-            phase: "Failed",
             conditions: [
-              { type: "Failed", status: "True", reason: "ImagePullFailed", message: "no image" },
+              {
+                type: "Ready",
+                status: "False",
+                reason: "PodFailed",
+                message: "no image",
+                observedGeneration: 1,
+              },
             ],
           },
         }),
@@ -108,8 +141,17 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
     const clients = {
       custom: {
         getNamespacedCustomObject: vi.fn().mockResolvedValue({
-          metadata: { uid: "uid-1" },
-          status: { phase: "Pending" },
+          metadata: { uid: "uid-1", generation: 1 },
+          status: {
+            conditions: [
+              {
+                type: "Ready",
+                status: "False",
+                reason: "DependenciesNotReady",
+                observedGeneration: 1,
+              },
+            ],
+          },
         }),
       },
       core: { readNamespacedPod: vi.fn() },
@@ -122,7 +164,7 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       pollMs: 5,
     });
     expect(result.resumable).toBe(false);
-    if (!result.resumable) expect(result.reason).toMatch(/did not reach Ready/);
+    if (!result.resumable) expect(result.reason).toMatch(/did not reach .*Ready/);
   });
 
   it("is not resumable when the backing pod is gone (404)", async () => {
@@ -130,7 +172,10 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       custom: {
         getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
       },
-      core: { readNamespacedPod: vi.fn().mockRejectedValue(notFound()) },
+      core: {
+        readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }),
+      },
     };
     const result = await checkLeaseResumable(clients as never, {
       namespace: "ns",
@@ -140,7 +185,7 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       pollMs: 10,
     });
     expect(result.resumable).toBe(false);
-    if (!result.resumable) expect(result.reason).toMatch(/pc-abc-pod no longer exists/);
+    if (!result.resumable) expect(result.reason).toMatch(/no backing pod was found/);
   });
 
   it("is not resumable when the pod is being torn down (deletionTimestamp set)", async () => {
@@ -149,10 +194,11 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
         getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
       },
       core: {
-        readNamespacedPod: vi.fn().mockResolvedValue({
-          metadata: { deletionTimestamp: "2026-06-10T00:00:00Z" },
-          status: { phase: "Running" },
-        }),
+        readNamespacedPod: vi.fn().mockResolvedValue(
+          sandboxOwnedPod("pc-abc-pod", {
+            deletionTimestamp: "2026-06-10T00:00:00Z",
+          }),
+        ),
       },
     };
     const result = await checkLeaseResumable(clients as never, {

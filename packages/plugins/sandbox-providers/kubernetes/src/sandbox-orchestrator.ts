@@ -15,7 +15,7 @@ export interface SandboxStatus {
  * is Job-backed (job-orchestrator.ts). Future backends slot in by exporting an
  * object conforming to this shape — e.g. a Kata-FC warm-pool backend that
  * additionally implements the optional pause/resume slots, or a CRD-backed
- * backend on kubernetes-sigs/agent-sandbox once it reaches Beta.
+ * backend on kubernetes-sigs/agent-sandbox v1beta1.
  */
 export interface SandboxOrchestrator {
   /** Provision the sandbox. Returns the runtime's stable UID. */

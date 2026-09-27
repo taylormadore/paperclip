@@ -44,9 +44,29 @@ describe("buildCiliumNetworkPolicyManifest", () => {
   it("includes a rule for paperclip-server callback", () => {
     const cnp = buildCiliumNetworkPolicyManifest(baseInput);
     const cb = cnp.spec.egress.find((e: { toEndpoints?: { matchLabels: Record<string, string> }[] }) =>
-      e.toEndpoints?.some((ep) => ep.matchLabels.app === "paperclip-server"),
+      e.toEndpoints?.some((ep) =>
+        ep.matchLabels["app.kubernetes.io/name"] === "paperclip" &&
+        ep.matchLabels["app.kubernetes.io/instance"] === "paperclip",
+      ),
     );
     expect(cb).toBeDefined();
+    expect(cb.toPorts?.[0].ports).toEqual([{ port: "3100", protocol: "TCP" }]);
+  });
+
+  it("allows kube-apiserver egress only when agentApiAccess is enabled", () => {
+    const defaultPolicy = buildCiliumNetworkPolicyManifest(baseInput);
+    expect(defaultPolicy.spec.egress.some((e: { toEntities?: string[] }) =>
+      e.toEntities?.includes("kube-apiserver"),
+    )).toBe(false);
+
+    const optedInPolicy = buildCiliumNetworkPolicyManifest({
+      ...baseInput,
+      agentApiAccess: true,
+    });
+    const apiRule = optedInPolicy.spec.egress.find((e: { toEntities?: string[] }) =>
+      e.toEntities?.includes("kube-apiserver"),
+    );
+    expect(apiRule).toEqual({ toEntities: ["kube-apiserver"] });
   });
 
   it("includes user-supplied CIDRs in toCIDRSet rule", () => {

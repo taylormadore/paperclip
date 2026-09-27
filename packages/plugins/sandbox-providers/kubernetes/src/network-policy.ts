@@ -86,7 +86,12 @@ export function buildNetworkPolicyManifests(input: BuildNetworkPolicyInput): Rec
           to: [
             {
               namespaceSelector: { matchLabels: { "kubernetes.io/metadata.name": input.paperclipServerNamespace } },
-              podSelector: { matchLabels: { app: "paperclip-server" } },
+              podSelector: {
+                matchLabels: {
+                  "app.kubernetes.io/name": "paperclip",
+                  "app.kubernetes.io/instance": "paperclip",
+                },
+              },
             },
           ],
           ports: [{ protocol: "TCP", port: 3100 }],

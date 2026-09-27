@@ -8,6 +8,7 @@ export interface EnsureTenantInput {
   paperclipServerNamespace: string;
   serviceAccountAnnotations: Record<string, string>;
   egressMode: "standard" | "cilium";
+  agentApiAccess?: boolean;
   egressAllowFqdns: string[];
   egressAllowCidrs: string[];
   resourceQuota: {
@@ -29,7 +30,8 @@ const LIMIT_RANGE_NAME = "paperclip-limits";
  * Lazy, first-write-wins tenant provisioning. Each helper checks if the named
  * resource exists and creates it only on 404; if it already exists, it is
  * left as-is — config-driven values (quota limits, RBAC permissions, network
- * policies, egress allow-list) are FROZEN at first provisioning time.
+ * policies, egress allow-list, and agent API egress) are frozen at first
+ * provisioning time.
  *
  * V1 limitation: changing KubernetesProviderConfig after a tenant namespace
  * is provisioned does NOT update the in-cluster resources. To apply config
@@ -222,6 +224,7 @@ async function ensureNetworkPolicies(clients: KubeClients, input: EnsureTenantIn
       paperclipServerNamespace: input.paperclipServerNamespace,
       egressAllowFqdns: input.egressAllowFqdns,
       egressAllowCidrs: input.egressAllowCidrs,
+      agentApiAccess: input.agentApiAccess,
     });
     await ensureCiliumNetworkPolicy(clients, input.namespace, cnp);
   } else {

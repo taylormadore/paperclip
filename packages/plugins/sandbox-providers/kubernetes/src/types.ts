@@ -13,12 +13,16 @@ export const kubernetesProviderConfigSchema = z
     companySlug: z.string().regex(/^[a-z0-9-]{1,32}$/).optional(),
 
     imageRegistry: z.string().url().optional(),
+    /** Exact environment-wide runtime image; takes precedence over imageRegistry. */
+    runtimeImage: z.string().trim().min(1).optional(),
     imageAllowList: z.array(z.string()).default([]),
     imagePullSecrets: z.array(z.string()).default([]),
 
     egressAllowFqdns: z.array(z.string()).default([]),
     egressAllowCidrs: z.array(z.string().regex(cidrRegex, "Invalid CIDR")).default([]),
     egressMode: z.enum(["cilium", "standard"]).default("standard"),
+    /** Mount the tenant ServiceAccount token and permit Cilium apiserver egress. */
+    agentApiAccess: z.boolean().default(false),
 
     defaultResources: z
       .object({
@@ -56,8 +60,8 @@ export const kubernetesProviderConfigSchema = z
     /**
      * The sandbox backend to use.
      *
-     * - `"sandbox-cr"` (default, alpha) — uses the kubernetes-sigs/agent-sandbox
-     *   Sandbox CRD (agents.x-k8s.io/v1alpha1). Creates a long-lived pod that
+     * - `"sandbox-cr"` (default) — uses the kubernetes-sigs/agent-sandbox
+     *   Sandbox CRD (agents.x-k8s.io/v1beta1). Creates a long-lived pod that
      *   paperclip-server can exec into for multi-command adapter-install workflows.
      *   Requires the agent-sandbox controller to be installed in the cluster.
      *
@@ -72,6 +76,16 @@ export const kubernetesProviderConfigSchema = z
     {
       message:
         "kubernetes provider requires one of `inCluster` or `kubeconfig`",
+    },
+  )
+  .refine(
+    (cfg) =>
+      !cfg.agentApiAccess ||
+      (cfg.backend === "sandbox-cr" && cfg.egressMode === "cilium"),
+    {
+      message:
+        "agentApiAccess requires backend `sandbox-cr` and egressMode `cilium`",
+      path: ["agentApiAccess"],
     },
   );
 

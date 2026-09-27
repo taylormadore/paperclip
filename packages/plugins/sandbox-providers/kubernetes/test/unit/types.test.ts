@@ -8,7 +8,46 @@ describe("kubernetesProviderConfigSchema", () => {
     expect(parsed.namespacePrefix).toBe("paperclip-");
     expect(parsed.imageAllowList).toEqual([]);
     expect(parsed.egressMode).toBe("standard");
+    expect(parsed.agentApiAccess).toBe(false);
     expect(parsed.jobTtlSecondsAfterFinished).toBe(900);
+  });
+
+  it("accepts sandbox-cr API access only with Cilium egress", () => {
+    const parsed = parseKubernetesProviderConfig({
+      inCluster: true,
+      backend: "sandbox-cr",
+      egressMode: "cilium",
+      agentApiAccess: true,
+    });
+    expect(parsed.agentApiAccess).toBe(true);
+  });
+
+  it("rejects agentApiAccess with the job backend or standard egress", () => {
+    expect(() =>
+      parseKubernetesProviderConfig({
+        inCluster: true,
+        backend: "job",
+        egressMode: "cilium",
+        agentApiAccess: true,
+      }),
+    ).toThrow(/agentApiAccess requires backend `sandbox-cr` and egressMode `cilium`/);
+
+    expect(() =>
+      parseKubernetesProviderConfig({
+        inCluster: true,
+        backend: "sandbox-cr",
+        egressMode: "standard",
+        agentApiAccess: true,
+      }),
+    ).toThrow(/agentApiAccess requires backend `sandbox-cr` and egressMode `cilium`/);
+  });
+
+  it("accepts an exact environment runtimeImage", () => {
+    const parsed = parseKubernetesProviderConfig({
+      inCluster: true,
+      runtimeImage: "registry.example/agent@sha256:abc123",
+    });
+    expect(parsed.runtimeImage).toBe("registry.example/agent@sha256:abc123");
   });
 
   it("accepts inline kubeconfig", () => {

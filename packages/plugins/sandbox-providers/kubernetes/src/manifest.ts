@@ -1,15 +1,15 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "paperclip.kubernetes-sandbox-provider";
-const PLUGIN_VERSION = "0.1.0-alpha.1";
+const PLUGIN_VERSION = "0.1.0-pilot.1";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
   apiVersion: 1,
   version: PLUGIN_VERSION,
-  displayName: "Kubernetes Sandbox (alpha)",
+  displayName: "Kubernetes Sandbox (pilot)",
   description:
-    "Built on kubernetes-sigs/agent-sandbox (v1alpha1). ALPHA — expect breaking changes as the upstream CRD evolves. Falls back to stable batch/v1 Job mode for clusters without agent-sandbox installed. First-party Paperclip sandbox-provider plugin for Kubernetes.",
+    "Uses kubernetes-sigs/agent-sandbox v1beta1 for long-lived sandbox pods, with a batch/v1 Job fallback. The Paperclip plugin remains an early-access feature.",
   author: "Paperclip",
   categories: ["automation"],
   capabilities: ["environment.drivers.register"],
@@ -22,7 +22,7 @@ const manifest: PaperclipPluginManifestV1 = {
       kind: "sandbox_provider",
       displayName: "Kubernetes",
       description:
-        "Dispatches agent runs in per-tenant Kubernetes namespaces. Default backend (sandbox-cr, alpha) uses kubernetes-sigs/agent-sandbox for multi-command exec; fallback backend (job) uses stable batch/v1 Job for clusters without agent-sandbox installed.",
+        "Dispatches agent runs in per-tenant Kubernetes namespaces. The sandbox-cr backend uses kubernetes-sigs/agent-sandbox v1beta1 for multi-command exec; the job backend uses batch/v1 for clusters without the controller.",
       configSchema: {
         type: "object",
         properties: {
@@ -48,6 +48,11 @@ const manifest: PaperclipPluginManifestV1 = {
           imageRegistry: {
             type: "string",
             description: "Override the default registry for agent runtime images (default: ghcr.io/paperclipai).",
+          },
+          runtimeImage: {
+            type: "string",
+            description:
+              "Exact runtime image reference for every agent in this environment (for example, a registry image pinned by digest). Takes precedence over adapter defaults and imageRegistry; configured by the environment administrator.",
           },
           imageAllowList: {
             type: "array",
@@ -75,6 +80,11 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             enum: ["standard", "cilium"],
             description: "Network policy mode. `cilium` enables FQDN-based egress filtering via CiliumNetworkPolicy.",
+          },
+          agentApiAccess: {
+            type: "boolean",
+            description:
+              "Default false. With backend `sandbox-cr` and egressMode `cilium`, mounts the tenant ServiceAccount token and allows egress to Cilium's kube-apiserver entity. The plugin-created tenant Role grants get pods/log; operators may bind other scoped Roles to that ServiceAccount.",
           },
           runtimeClassName: {
             type: "string",
@@ -106,7 +116,7 @@ const manifest: PaperclipPluginManifestV1 = {
             type: "string",
             enum: ["sandbox-cr", "job"],
             description:
-              "sandbox-cr (default, alpha — requires kubernetes-sigs/agent-sandbox installed) | job (stable fallback — batch/v1 Job, one-shot entrypoint, no multi-command exec)",
+              "sandbox-cr (default, requires the agents.x-k8s.io/v1beta1 CRD and controller) | job (stable fallback — batch/v1 Job, one-shot entrypoint, no multi-command exec)",
           },
         },
         anyOf: [

@@ -9,6 +9,14 @@ vi.mock("../../src/kube-client.js", () => ({
   makeKubeClients: vi.fn(() => h.clients),
 }));
 
+vi.mock("@paperclipai/plugin-sdk", () => ({
+  definePlugin: (definition: unknown) => ({ definition }),
+}));
+
+vi.mock("../../src/pod-exec.js", () => ({
+  execInPod: vi.fn(),
+}));
+
 import plugin from "../../src/plugin.js";
 
 const CONFIG = { inCluster: true, backend: "sandbox-cr" };
@@ -31,11 +39,40 @@ function notFound(): Error {
 
 function readySandboxCr(podName: string): Record<string, unknown> {
   return {
-    metadata: { uid: "uid-1" },
-    status: {
-      conditions: [{ type: "Ready", status: "True" }],
-      podName,
+    metadata: {
+      uid: "uid-1",
+      generation: 1,
+      annotations: { "agents.x-k8s.io/pod-name": podName },
     },
+    status: {
+      conditions: [
+        {
+          type: "Ready",
+          status: "True",
+          reason: "DependenciesReady",
+          observedGeneration: 1,
+        },
+      ],
+      selector: "agents.x-k8s.io/sandbox-name-hash=1a2b3c",
+    },
+  };
+}
+
+function sandboxOwnedPod(name: string) {
+  return {
+    metadata: {
+      name,
+      ownerReferences: [
+        {
+          apiVersion: "agents.x-k8s.io/v1beta1",
+          kind: "Sandbox",
+          name: "pc-abc",
+          uid: "uid-1",
+          controller: true,
+        },
+      ],
+    },
+    status: { phase: "Running" },
   };
 }
 
@@ -55,10 +92,7 @@ describe("onEnvironmentResumeLease", () => {
         getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
       },
       core: {
-        readNamespacedPod: vi.fn().mockResolvedValue({
-          metadata: {},
-          status: { phase: "Running" },
-        }),
+        readNamespacedPod: vi.fn().mockResolvedValue(sandboxOwnedPod("pc-abc-pod")),
       },
     };
 
@@ -144,7 +178,10 @@ describe("onEnvironmentResumeLease", () => {
       custom: {
         getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
       },
-      core: { readNamespacedPod: vi.fn().mockRejectedValue(notFound()) },
+      core: {
+        readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        listNamespacedPod: vi.fn().mockResolvedValue({ items: [] }),
+      },
     };
 
     const lease = await plugin.definition.onEnvironmentResumeLease!({

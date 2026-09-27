@@ -19,7 +19,7 @@ const baseInput = {
 describe("buildSandboxCrManifest", () => {
   it("returns a Sandbox CR with the correct apiVersion and kind", () => {
     const cr = buildSandboxCrManifest(baseInput);
-    expect(cr.apiVersion).toBe("agents.x-k8s.io/v1alpha1");
+    expect(cr.apiVersion).toBe("agents.x-k8s.io/v1beta1");
     expect(cr.kind).toBe("Sandbox");
   });
 
@@ -66,9 +66,14 @@ describe("buildSandboxCrManifest", () => {
     expect(container.securityContext.capabilities.drop).toEqual(["ALL"]);
   });
 
-  it("disables automountServiceAccountToken", () => {
+  it("disables automountServiceAccountToken by default", () => {
     const cr = buildSandboxCrManifest(baseInput);
     expect(cr.spec.podTemplate.spec.automountServiceAccountToken).toBe(false);
+  });
+
+  it("mounts the ServiceAccount token only when agentApiAccess is enabled", () => {
+    const cr = buildSandboxCrManifest({ ...baseInput, agentApiAccess: true });
+    expect(cr.spec.podTemplate.spec.automountServiceAccountToken).toBe(true);
   });
 
   it("declares emptyDir volume mounts for standard agent paths", () => {

@@ -1,4 +1,5 @@
-# This plugin uses only stable Kubernetes APIs. No CRD installation is required.
+# The job backend uses only stable Kubernetes APIs. The default sandbox-cr
+# backend also requires the agent-sandbox v1beta1 CRD and controller.
 #
 # Minimum cluster version: Kubernetes 1.27+
 #   - batch/v1 Job (GA since k8s 1.21)
@@ -9,6 +10,12 @@
 #   - fsGroupChangePolicy: OnRootMismatch (GA in k8s 1.23)
 #   - seccompProfile.type: RuntimeDefault (GA in k8s 1.19)
 #
+# Required for the default `sandbox-cr` backend:
+#   - kubernetes-sigs/agent-sandbox controller with
+#     agents.x-k8s.io/v1beta1/sandboxes installed.
+#   - Use `backend: job` to avoid the CRD/controller prerequisite. The job
+#     backend is one-shot and does not support multi-command exec.
+#
 # Optional CNI prerequisites for FQDN-based egress (egressMode: cilium):
 #   - Cilium >= 1.11 with hubble + DNS proxy enabled
 #   - cilium.io/v2 CiliumNetworkPolicy (provided by Cilium installation)
@@ -17,6 +24,3 @@
 #   - kata-containers with Firecracker hypervisor
 #   - nested-virt-capable nodes
 #
-# Future backends (not currently required):
-#   - kubernetes-sigs/agent-sandbox (when it reaches v1beta1) as an alternative
-#     backend for warm pools / templates / pause-resume.

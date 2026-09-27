@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1.6
+
+# This immutable Paperclip Codex runtime was built from the same
+# docker/agent-runtime and tools/agent-shim sources as v2026.916.1.
+# Build with --platform=linux/amd64; the digest is the published OCI index.
+FROM ghcr.io/paperclipai/agent-runtime-codex@sha256:3ec984b41bdcaa17690744f4e4123f3158e3f25b6c05a913e5945877b99cd8a4
+
+ARG TARGETARCH=amd64
+
+USER root
+
+RUN set -eu; \
+    test "${TARGETARCH}" = "amd64"; \
+    curl -fsSLo /tmp/kubectl \
+      --location \
+      https://dl.k8s.io/release/v1.35.8/bin/linux/amd64/kubectl; \
+    printf '%s  %s\n' \
+      874d5e72dbb819f43cff16bcd1e4f8bac5b7f2361fe1e55049b0a6c676fb0cbf \
+      /tmp/kubectl | sha256sum --check --status; \
+    install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl; \
+    rm /tmp/kubectl; \
+    command -v kubectl >/dev/null
+
+# Preserve the upstream runtime's non-root identity, entrypoint, workdir, and
+# CMD. The Kubernetes provider mounts writable HOME, cache, workspace, and /tmp
+# volumes when it enables readOnlyRootFilesystem.
+USER 1000:1000

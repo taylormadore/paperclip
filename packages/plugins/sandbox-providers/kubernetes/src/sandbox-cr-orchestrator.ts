@@ -1,6 +1,6 @@
 /**
  * SandboxOrchestrator implementation backed by the kubernetes-sigs/agent-sandbox
- * Sandbox CRD (agents.x-k8s.io/v1alpha1).
+ * Sandbox CRD (agents.x-k8s.io/v1beta1).
  *
  * The Sandbox CR creates a long-lived pod that paperclip-server can exec into
  * for multi-command adapter-install workflows — the key architectural win over
@@ -8,8 +8,8 @@
  *
  * Key semantic differences from jobOrchestrator:
  * - claim() creates a Sandbox CR via CustomObjectsApi instead of a batch Job
- * - getStatus() maps Sandbox phase (Pending|Ready|Terminating|Failed) to SandboxStatus
- * - findPod() reads status.podName from the Sandbox CR (falls back to label query)
+ * - getStatus() maps v1beta1 conditions to SandboxStatus
+ * - findPod() uses the v1beta1 status selector and verifies Sandbox ownership
  * - waitForCompletion() means "wait until pod is Ready to exec" NOT "wait until
  *   workload finishes". The Sandbox pod runs sleep infinity; execution completion
  *   is tracked by the individual execInPod() calls.
@@ -23,15 +23,17 @@
 
 import type { KubeClients } from "./kube-client.js";
 import type { SandboxOrchestrator, SandboxStatus } from "./sandbox-orchestrator.js";
-
-const SANDBOX_GROUP = "agents.x-k8s.io";
-const SANDBOX_VERSION = "v1alpha1";
-const SANDBOX_PLURAL = "sandboxes";
+import {
+  SANDBOX_API_VERSION,
+  SANDBOX_GROUP,
+  SANDBOX_PLURAL,
+  SANDBOX_VERSION,
+} from "./sandbox-cr-api.js";
 
 export class SandboxCrTimeoutError extends Error {
   constructor(namespace: string, name: string, timeoutMs: number) {
     super(
-      `Sandbox ${namespace}/${name} did not reach Ready phase within ${timeoutMs}ms`,
+      `Sandbox ${namespace}/${name} did not reach a current Ready condition within ${timeoutMs}ms`,
     );
     this.name = "SandboxCrTimeoutError";
   }
@@ -41,57 +43,175 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Map a Sandbox CR status.phase value to our SandboxStatus shape.
- * Sandbox phases: Pending | Ready | Terminating | Failed
- */
-function mapSandboxPhase(
-  cr: Record<string, unknown>,
-): SandboxStatus {
-  const status = (cr.status as Record<string, unknown>) ?? {};
-  const phase = (status.phase as string) ?? "Pending";
+type SandboxCondition = {
+  type?: string;
+  status?: string;
+  reason?: string;
+  message?: string;
+  observedGeneration?: number;
+};
 
-  switch (phase) {
-    case "Ready":
+// ReconcilerError is intentionally excluded: v1.0.2 reports any reconciliation
+// error through Ready and asks controller-runtime to retry, so it may recover.
+const TERMINAL_READY_REASONS = new Set([
+  "MultiplePods",
+  "PodFailed",
+  "PodSucceeded",
+  "SandboxExpired",
+  "SandboxSuspended",
+]);
+
+function getConditions(cr: Record<string, unknown>): SandboxCondition[] {
+  const status = (cr.status as Record<string, unknown>) ?? {};
+  return Array.isArray(status.conditions)
+    ? (status.conditions as SandboxCondition[])
+    : [];
+}
+
+function getCondition(
+  conditions: SandboxCondition[],
+  type: string,
+): SandboxCondition | undefined {
+  return conditions.find((condition) => condition.type === type);
+}
+
+function isConditionCurrent(
+  condition: SandboxCondition | undefined,
+  cr: Record<string, unknown>,
+): boolean {
+  if (!condition) return false;
+  const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+  const generation = metadata.generation;
+  if (typeof generation !== "number") return true;
+  return (
+    typeof condition.observedGeneration === "number" &&
+    condition.observedGeneration >= generation
+  );
+}
+
+function getTerminalStatus(
+  conditions: SandboxCondition[],
+  cr: Record<string, unknown>,
+): SandboxStatus | undefined {
+  const finished = getCondition(conditions, "Finished");
+  if (finished?.status === "True" && isConditionCurrent(finished, cr)) {
+    if (finished.reason === "PodSucceeded") {
       return {
-        phase: "Running", // SandboxStatus.phase uses Job semantics; "Running" = active pod
-        complete: false,
-        active: 1,
-        succeeded: 0,
-        failed: 0,
-      };
-    case "Terminating":
-      return {
-        phase: "Running",
-        complete: false,
+        phase: "Succeeded",
+        complete: true,
         active: 0,
-        succeeded: 0,
+        succeeded: 1,
         failed: 0,
-        reason: "Terminating",
-      };
-    case "Failed": {
-      const conditions = (status.conditions as { type?: string; reason?: string; message?: string }[]) ?? [];
-      const failedCond = conditions.find((c) => c.type === "Failed");
-      return {
-        phase: "Failed",
-        complete: false,
-        active: 0,
-        succeeded: 0,
-        failed: 1,
-        reason: failedCond?.reason,
-        message: failedCond?.message,
+        reason: finished.reason,
+        message: finished.message,
       };
     }
-    default:
-      // "Pending" or unknown
-      return {
-        phase: "Pending",
-        complete: false,
-        active: 0,
-        succeeded: 0,
-        failed: 0,
-      };
+    return {
+      phase: "Failed",
+      complete: true,
+      active: 0,
+      succeeded: 0,
+      failed: 1,
+      reason: finished.reason ?? "PodFailed",
+      message: finished.message,
+    };
   }
+
+  const ready = getCondition(conditions, "Ready");
+  if (
+    ready?.status === "False" &&
+    isConditionCurrent(ready, cr) &&
+    ready.reason &&
+    TERMINAL_READY_REASONS.has(ready.reason)
+  ) {
+    if (ready.reason === "PodSucceeded") {
+      return {
+        phase: "Succeeded",
+        complete: true,
+        active: 0,
+        succeeded: 1,
+        failed: 0,
+        reason: ready.reason,
+        message: ready.message,
+      };
+    }
+    return {
+      phase: "Failed",
+      complete: true,
+      active: 0,
+      succeeded: 0,
+      failed: 1,
+      reason: ready.reason,
+      message: ready.message,
+    };
+  }
+
+  const failed = getCondition(conditions, "Failed");
+  if (failed?.status === "True" && isConditionCurrent(failed, cr)) {
+    return {
+      phase: "Failed",
+      complete: true,
+      active: 0,
+      succeeded: 0,
+      failed: 1,
+      reason: failed.reason,
+      message: failed.message,
+    };
+  }
+  return undefined;
+}
+
+/** Map v1beta1 conditions to the provider's Job-like status contract. */
+function mapSandboxStatus(cr: Record<string, unknown>): SandboxStatus {
+  const conditions = getConditions(cr);
+  const terminal = getTerminalStatus(conditions, cr);
+  if (terminal) return terminal;
+
+  const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+  if (metadata.deletionTimestamp) {
+    return {
+      phase: "Running",
+      complete: false,
+      active: 0,
+      succeeded: 0,
+      failed: 0,
+      reason: "Terminating",
+    };
+  }
+
+  const ready = getCondition(conditions, "Ready");
+  if (ready?.status === "True" && isConditionCurrent(ready, cr)) {
+    return {
+      phase: "Running",
+      complete: false,
+      active: 1,
+      succeeded: 0,
+      failed: 0,
+    };
+  }
+
+  const suspended = getCondition(conditions, "Suspended");
+  if (suspended?.status === "True" && isConditionCurrent(suspended, cr)) {
+    return {
+      phase: "Failed",
+      complete: false,
+      active: 0,
+      succeeded: 0,
+      failed: 1,
+      reason: suspended.reason ?? "SandboxSuspended",
+      message: suspended.message,
+    };
+  }
+
+  return {
+    phase: "Pending",
+    complete: false,
+    active: 0,
+    succeeded: 0,
+    failed: 0,
+    reason: ready?.reason,
+    message: ready?.message,
+  };
 }
 
 export async function createSandboxCr(
@@ -123,21 +243,21 @@ export async function getSandboxCrStatus(
     plural: SANDBOX_PLURAL,
     name,
   });
-  return mapSandboxPhase(result as Record<string, unknown>);
+  return mapSandboxStatus(result as Record<string, unknown>);
 }
 
 /**
- * Returns the pod name backing a Sandbox CR.
- * Primary: read status.podName from the CR (set by the controller once ready).
- * Fallback: list pods in the namespace filtered by the paperclip.io/managed-by
- * label and the sandbox name label set on the pod template.
+ * Returns the pod name backing a Sandbox CR. v1beta1 exposes the controller's
+ * exact pod label selector as status.selector (the selector uses a hash label),
+ * and the controller-owned Pod name normally matches the Sandbox name. Every
+ * result must carry an ownerReference to this exact Sandbox UID before exec.
  */
 export async function findPodForSandbox(
   clients: KubeClients,
   namespace: string,
   name: string,
 ): Promise<string | null> {
-  // Primary: read status.podName from the Sandbox CR
+  // Read the CR once for its v1beta1 selector and UID before resolving a Pod.
   const cr = await clients.custom.getNamespacedCustomObject({
     group: SANDBOX_GROUP,
     version: SANDBOX_VERSION,
@@ -147,39 +267,79 @@ export async function findPodForSandbox(
   }) as Record<string, unknown>;
 
   const status = (cr.status as Record<string, unknown>) ?? {};
-  const podName = status.podName as string | undefined;
-  if (podName && podName.trim().length > 0) {
-    return podName;
-  }
-
-  // Secondary: the agent-sandbox controller (v0.4.x) names the backing pod
-  // EXACTLY after the Sandbox CR and labels it only with
-  // agents.x-k8s.io/sandbox-name-hash (a hash, not the full name), so the
-  // full-name label selector below matches nothing on that controller. An
-  // exact-name GET is collision-free (unlike name-prefix matching, which
-  // could hit a concurrent sandbox sharing a prefix) and resolves the pod on
-  // every controller version that keeps pod name == sandbox name.
-  try {
-    const pod = (await clients.core.readNamespacedPod({ namespace, name })) as {
-      metadata?: { name?: string };
-    };
-    if (pod?.metadata?.name) {
-      return pod.metadata.name;
+  const crMetadata = (cr.metadata as Record<string, unknown>) ?? {};
+  const sandboxUid =
+    typeof crMetadata.uid === "string" && crMetadata.uid.trim()
+      ? crMetadata.uid
+      : undefined;
+  if (!sandboxUid) return null;
+  const isOwnedPod = (pod: Record<string, unknown>): boolean => {
+    const podMetadata = (pod.metadata as Record<string, unknown>) ?? {};
+    const ownerReferences = Array.isArray(podMetadata.ownerReferences)
+      ? (podMetadata.ownerReferences as Array<Record<string, unknown>>)
+      : [];
+    return ownerReferences.some((owner) =>
+      owner.apiVersion === SANDBOX_API_VERSION &&
+      owner.kind === "Sandbox" &&
+      owner.name === name &&
+      owner.controller === true &&
+      owner.uid === sandboxUid,
+    );
+  };
+  const readOwnedPod = async (
+    podName: string,
+  ): Promise<Record<string, unknown> | null> => {
+    try {
+      const pod = (await clients.core.readNamespacedPod({
+        namespace,
+        name: podName,
+      })) as Record<string, unknown>;
+      return isOwnedPod(pod) ? pod : null;
+    } catch (err) {
+      const code =
+        (err as { code?: number; statusCode?: number }).code ??
+        (err as { code?: number; statusCode?: number }).statusCode;
+      if (code === 404) return null;
+      throw err;
     }
-  } catch (err) {
-    const code =
-      (err as { code?: number; statusCode?: number }).code ??
-      (err as { code?: number; statusCode?: number }).statusCode;
-    if (code !== 404) throw err;
-  }
+  };
 
-  // Fallback: list pods by a full-name sandbox label, for controller versions
-  // that label pods with the sandbox name. A broader managed-by selector plus
-  // name-prefix narrowing could match a concurrent sandbox whose generated
-  // name shares a prefix, and exec would target the wrong lease's pod.
+  // Warm-pool controllers can report a Pod name in this annotation. Otherwise,
+  // the standard controller names the Pod after the Sandbox.
+  const annotations =
+    (crMetadata.annotations as Record<string, unknown> | undefined) ?? {};
+  const annotatedPodName = annotations["agents.x-k8s.io/pod-name"];
+  const candidateNames = [
+    ...(typeof annotatedPodName === "string" && annotatedPodName.trim()
+      ? [annotatedPodName.trim()]
+      : []),
+    name,
+  ];
+  const exactMatches: Record<string, unknown>[] = [];
+  for (const candidate of new Set(candidateNames)) {
+    const pod = await readOwnedPod(candidate);
+    if (pod) exactMatches.push(pod);
+  }
+  const runningExact = exactMatches.find((pod) => {
+    const podStatus = (pod.status as Record<string, unknown>) ?? {};
+    return podStatus.phase === "Running";
+  });
+  const exact = runningExact ?? exactMatches[0];
+  const exactName = ((exact?.metadata as Record<string, unknown>) ?? {}).name;
+  if (typeof exactName === "string") return exactName;
+
+  // v1beta1's selector is the controller-written sandbox-name-hash selector;
+  // it avoids relying on the removed full-name sandbox label or name prefixes.
+  const selector = status.selector;
+  const selectorMatch =
+    typeof selector === "string"
+      ? /^agents\.x-k8s\.io\/sandbox-name-hash=([A-Za-z0-9_.-]+)$/.exec(selector)
+      : null;
+  if (!selectorMatch) return null;
+
   const result = await clients.core.listNamespacedPod({
     namespace,
-    labelSelector: `agents.x-k8s.io/sandbox-name=${name}`,
+    labelSelector: selector as string,
   });
   const items =
     (
@@ -193,10 +353,12 @@ export async function findPodForSandbox(
       ).items
     ) ?? [];
 
-  // The label selector already scopes to exactly this sandbox's pod(s); keep a
-  // defensive re-check on the label value only (no name-prefix matching).
+  // Keep defensive checks for both the status selector and the exact CR UID.
   const matching = items.filter(
-    (p) => (p.metadata?.labels ?? {})["agents.x-k8s.io/sandbox-name"] === name,
+    (pod) =>
+      (pod.metadata?.labels ?? {})["agents.x-k8s.io/sandbox-name-hash"] ===
+        selectorMatch[1] &&
+      isOwnedPod(pod as unknown as Record<string, unknown>),
   );
 
   const running = matching.find((p) => p.status?.phase === "Running");
@@ -265,32 +427,36 @@ export async function waitForSandboxReady(
       name,
     }) as Record<string, unknown>;
 
-    const status = (cr.status as Record<string, unknown>) ?? {};
-    // agent-sandbox v1alpha1 uses status.conditions[type=Ready,status=True],
-    // not status.phase. Fall back to phase for forward-compat.
-    const conditions = Array.isArray(status.conditions) ? status.conditions as Array<Record<string, unknown>> : [];
-    const readyCondition = conditions.find((c) => c.type === "Ready");
-    const failedCondition = conditions.find((c) => c.type === "Failed" || (c.type === "Ready" && c.status === "False" && typeof c.reason === "string" && /failed/i.test(c.reason)));
-    const phase = (status.phase as string) ?? "";
-
-    if (readyCondition?.status === "True" || phase === "Ready") {
-      return mapSandboxPhase(cr);
-    }
-    if (failedCondition?.status === "True" || phase === "Failed") {
-      const mapped = mapSandboxPhase(cr);
+    const conditions = getConditions(cr);
+    const terminal = getTerminalStatus(conditions, cr);
+    if (terminal) {
       throw new Error(
-        `Sandbox ${namespace}/${name} failed: ${mapped.reason ?? (failedCondition?.reason as string) ?? "unknown reason"} — ${mapped.message ?? (failedCondition?.message as string) ?? ""}`,
+        `Sandbox ${namespace}/${name} failed: ${terminal.reason ?? "unknown reason"} — ${terminal.message ?? ""}`,
       );
     }
-    if (phase === "Terminating") {
+    const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+    if (metadata.deletionTimestamp) {
       // A Sandbox being torn down will never transition to Ready. Polling
       // until the deadline would burn the full timeoutMs (potentially
       // 30+ minutes) before throwing a generic timeout. Fail fast instead
       // so the caller can surface a clear "the lease is being released"
       // error and decide whether to retry against a fresh Sandbox.
       throw new Error(
-        `Sandbox ${namespace}/${name} is Terminating — cannot wait for Ready`,
+        `Sandbox ${namespace}/${name} is terminating — cannot wait for Ready`,
       );
+    }
+    const suspended = getCondition(conditions, "Suspended");
+    if (suspended?.status === "True" && isConditionCurrent(suspended, cr)) {
+      throw new Error(
+        `Sandbox ${namespace}/${name} is suspended — cannot wait for Ready`,
+      );
+    }
+    const readyCondition = getCondition(conditions, "Ready");
+    if (
+      readyCondition?.status === "True" &&
+      isConditionCurrent(readyCondition, cr)
+    ) {
+      return mapSandboxStatus(cr);
     }
     // Pending — keep polling
     await sleep(pollMs);

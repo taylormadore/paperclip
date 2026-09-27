@@ -28,6 +28,7 @@ import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./ad
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
 import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
+import { SANDBOX_API_VERSION } from "./sandbox-cr-api.js";
 import { ensureTenant } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
 import { FastUploadInterceptor } from "./upload-interceptor.js";
@@ -342,6 +343,7 @@ const plugin = definePlugin({
       paperclipServerNamespace: PAPERCLIP_SERVER_NAMESPACE,
       serviceAccountAnnotations: config.serviceAccountAnnotations,
       egressMode: config.egressMode,
+      agentApiAccess: config.agentApiAccess,
       egressAllowFqdns: [...adapterDefaults.allowFqdns, ...config.egressAllowFqdns],
       egressAllowCidrs: config.egressAllowCidrs,
       resourceQuota: DEFAULT_RESOURCE_QUOTA,
@@ -359,7 +361,7 @@ const plugin = definePlugin({
       adapterType: effectiveAdapterType,
     });
 
-    const image = resolveImage(
+    const image = config.runtimeImage ?? resolveImage(
       { imageOverride: null },
       adapterDefaults,
       { imageAllowList: config.imageAllowList, imageRegistry: config.imageRegistry },
@@ -377,6 +379,7 @@ const plugin = definePlugin({
           image,
           envSecretName: secretName,
           serviceAccountName: TENANT_SERVICE_ACCOUNT,
+          agentApiAccess: config.agentApiAccess,
           labels,
           resources: config.defaultResources ?? {},
           runtimeClassName: config.runtimeClassName,
@@ -407,7 +410,7 @@ const plugin = definePlugin({
         runId: params.runId,
         workloadName: jobName,
         ownerReference: {
-          apiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
+          apiVersion: isSandboxCrBackend ? SANDBOX_API_VERSION : "batch/v1",
           kind: isSandboxCrBackend ? "Sandbox" : "Job",
           name: jobName,
           uid: ownerUid,
@@ -438,7 +441,7 @@ const plugin = definePlugin({
       secretName,
       runId: params.runId,
       ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
-      ownerApiVersion: isSandboxCrBackend ? "agents.x-k8s.io/v1alpha1" : "batch/v1",
+      ownerApiVersion: isSandboxCrBackend ? SANDBOX_API_VERSION : "batch/v1",
       ownerName: jobName,
       ownerUid,
       bootstrapToken,

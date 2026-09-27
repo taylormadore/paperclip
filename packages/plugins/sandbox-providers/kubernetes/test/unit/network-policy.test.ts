@@ -47,7 +47,10 @@ describe("buildNetworkPolicyManifests", () => {
   it("uses paperclip-server pod label selector for callback ingress to paperclip ns", () => {
     const [, egress] = buildNetworkPolicyManifests(baseInput);
     const callbackRule = egress.spec.egress.find((r: { to: { podSelector?: { matchLabels?: Record<string, string> } }[] }) =>
-      r.to.some((t) => t.podSelector?.matchLabels?.app === "paperclip-server"),
+      r.to.some((t) =>
+        t.podSelector?.matchLabels?.["app.kubernetes.io/name"] === "paperclip" &&
+        t.podSelector?.matchLabels?.["app.kubernetes.io/instance"] === "paperclip",
+      ),
     );
     expect(callbackRule).toBeDefined();
     expect(callbackRule.ports[0].port).toBe(3100);

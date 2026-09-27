@@ -3,6 +3,8 @@ export interface BuildCiliumNetworkPolicyInput {
   paperclipServerNamespace: string;
   egressAllowFqdns: string[];
   egressAllowCidrs: string[];
+  /** Allow agent endpoints to reach Cilium's kube-apiserver entity. */
+  agentApiAccess?: boolean;
   name?: string;
   endpointSelector?: Record<string, string>;
   includeBaseRules?: boolean;
@@ -43,12 +45,19 @@ export function buildCiliumNetworkPolicyManifest(input: BuildCiliumNetworkPolicy
       {
         matchLabels: {
           "k8s:io.kubernetes.pod.namespace": input.paperclipServerNamespace,
-          app: "paperclip-server",
+          "app.kubernetes.io/name": "paperclip",
+          "app.kubernetes.io/instance": "paperclip",
         },
       },
     ],
     toPorts: [{ ports: [{ port: "3100", protocol: "TCP" }] }],
   });
+
+  if (input.includeBaseRules !== false && input.agentApiAccess) {
+    // Keep this entity-wide rather than port-scoped: Cilium may evaluate the
+    // translated backend port (often 6443) instead of the public 443 port.
+    egress.push({ toEntities: ["kube-apiserver"] });
+  }
 
   if (input.egressAllowCidrs.length > 0) {
     egress.push({

@@ -9,12 +9,15 @@
  *
  * Security baseline is identical to buildJobManifest (pod-spec-builder.ts):
  * non-root, drop ALL caps, read-only rootFS, Tini PID 1, seccomp
- * RuntimeDefault, fsGroupChangePolicy OnRootMismatch, automountSAToken=false.
+ * RuntimeDefault, fsGroupChangePolicy OnRootMismatch, and no ServiceAccount
+ * token unless the environment administrator opts into agentApiAccess.
  *
  * NOTE: paperclip-server runs OUTSIDE the cluster, so we cannot set ownerReferences
  * on the Sandbox CR (the owner would need to be an in-cluster resource). The
  * release path is explicit delete via sandboxCrOrchestrator.release().
  */
+
+import { SANDBOX_API_VERSION } from "./sandbox-cr-api.js";
 
 export interface BuildSandboxCrManifestInput {
   namespace: string;
@@ -23,6 +26,8 @@ export interface BuildSandboxCrManifestInput {
   image: string;
   envSecretName: string;
   serviceAccountName: string;
+  /** Mount the tenant ServiceAccount's projected token into the agent pod. */
+  agentApiAccess?: boolean;
   labels: Record<string, string>;
   resources: {
     requests?: { cpu?: string; memory?: string };
@@ -40,7 +45,7 @@ export function buildSandboxCrManifest(
     "paperclip.io/role": "agent",
   };
   return {
-    apiVersion: "agents.x-k8s.io/v1alpha1",
+    apiVersion: SANDBOX_API_VERSION,
     kind: "Sandbox",
     metadata: {
       name: input.sandboxName,
@@ -56,10 +61,9 @@ export function buildSandboxCrManifest(
         },
         spec: {
           serviceAccountName: input.serviceAccountName,
-          // Agent containers call back to paperclip-server via HTTPS egress;
-          // they never call the Kubernetes API, so mounting an SA token is
-          // unnecessary attack surface.
-          automountServiceAccountToken: false,
+          // Token mounting is disabled by default and enabled only when the
+          // provider config opts into the tenant ServiceAccount's scoped API access.
+          automountServiceAccountToken: input.agentApiAccess ?? false,
           // Sandbox controller requires restartPolicy: Always so the pod
           // stays running between exec calls.
           restartPolicy: "Always",
