@@ -194,9 +194,9 @@ npm run typecheck
 npm test
 node scripts/build-plugin-artifact.mjs --out /tmp/paperclip-kubernetes-artifact
 podman build \
-  --build-arg PLUGIN_VERSION=0.1.0-pilot.1 \
+  --build-arg PLUGIN_VERSION=0.1.0-pilot.2 \
   -f Dockerfile.artifact \
-  -t paperclip-kubernetes-plugin:0.1.0-pilot.1 \
+  -t paperclip-kubernetes-plugin:0.1.0-pilot.2 \
   /tmp/paperclip-kubernetes-artifact
 ```
 
@@ -204,7 +204,7 @@ The Dockerfile defaults to a digest-pinned Alpine base image. The artifact build
 rejects an existing output path, verifies the exact runtime dependency
 versions, copies the committed npm lockfile into the payload, and confirms direct runtime
 dependencies are installed inside `/plugin/node_modules`. The plugin package
-and manifest use version `0.1.0-pilot.1`; the SDK dependency is pinned to
+and manifest use version `0.1.0-pilot.2`; the SDK dependency is pinned to
 `2026.916.1`, the SDK version deployed with the pilot server.
 
 To run the kind-cluster integration test (requires `kubectl --context kind-paperclip` and a pre-loaded alpine image; see `test/integration/end-to-end-run.test.ts`):

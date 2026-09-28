@@ -114,11 +114,36 @@ describe("onEnvironmentResumeLease", () => {
         secretName: "pc-abc-env",
         phase: "Running",
         backend: "sandbox-cr",
+        // Older persisted leases did not contain the root. Resume repairs them
+        // to match the provider's existing /workspace realization default.
+        remoteCwd: "/workspace",
         resumedLease: true,
         // sandbox-cr has a pod-exec channel, so native file sync stays enabled.
         nativeFileSyncUnsupported: false,
       }),
     );
+  });
+
+  it("preserves a remote workspace root already recorded on a lease", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue(sandboxOwnedPod("pc-abc-pod")),
+      },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata({ remoteCwd: "/workspaces/acme" }),
+    });
+
+    expect(lease.metadata?.remoteCwd).toBe("/workspaces/acme");
   });
 
   it("flags a resumed job-backend lease as native-sync-unsupported so the server keeps the base64 fallback", async () => {

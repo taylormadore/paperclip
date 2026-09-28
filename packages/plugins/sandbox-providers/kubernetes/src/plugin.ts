@@ -60,6 +60,7 @@ const PAPERCLIP_SERVER_NAMESPACE = "paperclip";
 
 // Name of the ServiceAccount created inside each tenant namespace by ensureTenant.
 const TENANT_SERVICE_ACCOUNT = "paperclip-tenant-sa";
+const DEFAULT_WORKSPACE_REMOTE_DIR = "/workspace";
 
 // Resource quota defaults applied to every tenant namespace (tunable via
 // config in a future iteration).
@@ -120,10 +121,17 @@ const readySandboxesByLease = new Set<string>();
 const RESUME_READY_TIMEOUT_MS = 30_000;
 const RESUME_READY_POLL_MS = 1_000;
 
+function resolveWorkspaceRemoteDir(remoteCwd: unknown): string {
+  if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
+    return remoteCwd.trim();
+  }
+  return DEFAULT_WORKSPACE_REMOTE_DIR;
+}
+
 // The workspace remote dir is the confinement root for native file sync. It is
-// recorded on the lease metadata at realizeWorkspace time (`remoteCwd`); require
-// it so a sync can never run without a concrete root to confine every sandbox
-// path against.
+// initialized on the lease metadata at acquire time to match realizeWorkspace's
+// default, so sync callers that retain the original lease still have a concrete
+// root to confine every sandbox path against.
 function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   const remoteCwd = lease.metadata?.remoteCwd;
   if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
@@ -457,6 +465,7 @@ const plugin = definePlugin({
       secretName,
       phase: "Pending",
       backend: config.backend,
+      remoteCwd: DEFAULT_WORKSPACE_REMOTE_DIR,
       scopedNetworkPolicyName,
       scopedNetworkEgress,
       // Native file sync streams over a pod exec; only the sandbox-cr backend
@@ -532,6 +541,7 @@ const plugin = definePlugin({
       secretName,
       phase: check.phase,
       backend: leaseBackend,
+      remoteCwd: resolveWorkspaceRemoteDir(params.leaseMetadata?.remoteCwd),
       scopedNetworkPolicyName:
         typeof params.leaseMetadata?.scopedNetworkPolicyName === "string"
           ? params.leaseMetadata.scopedNetworkPolicyName
@@ -562,7 +572,7 @@ const plugin = definePlugin({
     const cwd =
       params.workspace.remotePath && params.workspace.remotePath.trim().length > 0
         ? params.workspace.remotePath.trim()
-        : "/workspace";
+        : DEFAULT_WORKSPACE_REMOTE_DIR;
     return {
       cwd,
       metadata: {

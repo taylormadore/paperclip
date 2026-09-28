@@ -104,6 +104,8 @@ export interface KubernetesLeaseMetadata {
   phase: "Pending" | "Running" | "Succeeded" | "Failed";
   /** Which backend provisioned this lease. */
   backend: "sandbox-cr" | "job";
+  /** Workspace root used to confine native file-sync paths. */
+  remoteCwd: string;
   scopedNetworkPolicyName: string | null;
   scopedNetworkEgress: {
     allowFqdns: string[];

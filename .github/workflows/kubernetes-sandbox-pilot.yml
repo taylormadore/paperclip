@@ -51,7 +51,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/taylormadore/paperclip-plugin-kubernetes:git-${{ github.sha }}
-            ghcr.io/taylormadore/paperclip-plugin-kubernetes:0.1.0-pilot.1
+            ghcr.io/taylormadore/paperclip-plugin-kubernetes:0.1.0-pilot.2
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}

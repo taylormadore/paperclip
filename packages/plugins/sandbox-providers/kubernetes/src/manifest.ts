@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "paperclip.kubernetes-sandbox-provider";
-const PLUGIN_VERSION = "0.1.0-pilot.1";
+const PLUGIN_VERSION = "0.1.0-pilot.2";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
