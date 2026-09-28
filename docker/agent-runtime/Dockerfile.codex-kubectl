@@ -9,6 +9,9 @@ ARG TARGETARCH=amd64
 
 USER root
 
+RUN npm install -g @openai/codex@0.155.1 \
+    && codex --version | grep -Fx 'codex-cli 0.155.1'
+
 RUN set -eu; \
     test "${TARGETARCH}" = "amd64"; \
     curl -fsSLo /tmp/kubectl \

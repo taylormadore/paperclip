@@ -82,7 +82,7 @@ jobs:
           push: true
           tags: |
             ghcr.io/taylormadore/paperclip-agent-runtime-codex-kubectl:git-${{ github.sha }}
-            ghcr.io/taylormadore/paperclip-agent-runtime-codex-kubectl:pilot-1
+            ghcr.io/taylormadore/paperclip-agent-runtime-codex-kubectl:pilot-2
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
