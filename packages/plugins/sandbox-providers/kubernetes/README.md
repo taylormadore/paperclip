@@ -212,3 +212,24 @@ To run the kind-cluster integration test (requires `kubectl --context kind-paper
 ```bash
 RUN_K8S_INTEGRATION_TESTS=1 pnpm test test/integration/end-to-end-run.test.ts
 ```
+
+## Disposable cluster smoke check
+
+From the repository root, run the standalone provider against a cluster with
+Agent Sandbox v1beta1 installed. The optional API-access check requires Cilium
+and a runtime image containing Codex and kubectl. The kubeconfig must permit
+creating and deleting a disposable namespace and its test resources.
+
+```sh
+node packages/plugins/sandbox-providers/kubernetes/scripts/sandbox-smoke.mjs \
+  --plugin-dir /tmp/paperclip-kubernetes-artifact/plugin \
+  --kubeconfig /path/to/kubeconfig \
+  --image registry.example/codex-kubectl@sha256:IMAGE_DIGEST \
+  --output /tmp/paperclip-sandbox-smoke.json \
+  --agent-api-access
+```
+
+This explicitly creates cluster resources, checks create/Ready/exec/delete,
+and verifies cleanup in a finally block. API-access mode additionally checks
+scoped Pod reads, ConfigMap create/get/delete, and denied Secret reads. Store
+the generated JSON with the relevant PR or CI run, not in the source tree.
