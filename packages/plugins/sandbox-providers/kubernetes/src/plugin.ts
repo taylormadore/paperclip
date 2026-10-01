@@ -27,7 +27,10 @@ import { createKubeConfig, makeKubeClients } from "./kube-client.js";
 import { getAdapterDefaults, buildAdapterEnv, resolveRunAdapterType } from "./adapter-defaults.js";
 import { resolveImage } from "./image-allowlist.js";
 import { buildJobManifest } from "./pod-spec-builder.js";
-import { buildSandboxCrManifest } from "./sandbox-cr-builder.js";
+import {
+  buildSandboxCrManifest,
+  resolveSandboxShutdownTime,
+} from "./sandbox-cr-builder.js";
 import { SANDBOX_API_VERSION } from "./sandbox-cr-api.js";
 import { ensureTenant } from "./tenant-orchestrator.js";
 import { createPerRunSecret } from "./secret-manager.js";
@@ -36,10 +39,24 @@ import { jobOrchestrator, JobTimeoutError } from "./job-orchestrator.js";
 import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
+  SandboxIdentityMismatchError,
+  SandboxPodIdentityTimeoutError,
+  deleteSandboxCrIfUid,
+  getSandboxPodIdentity,
+  waitForSandboxPodIdentity,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, execInPodStreaming, wrapCommandWithEnv } from "./pod-exec.js";
+import {
+  execInPod,
+  execInPodStreaming,
+  wrapCommandWithPodUid,
+} from "./pod-exec.js";
 import { performSyncIn, performSyncOut, type PodStreamExec } from "./file-sync.js";
-import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
+import {
+  checkLeaseResumable,
+  destroyLeaseResources,
+  isKubeUidPreconditionConflictError,
+  isKubeNotFoundError,
+} from "./lease-lifecycle.js";
 import {
   appendNetworkEgressDenyHint,
   createScopedNetworkEgressPolicyOrReleaseWorkload,
@@ -140,6 +157,48 @@ function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   throw new Error("Kubernetes file sync requires a workspace remote dir on the lease metadata.");
 }
 
+function requireSandboxLeaseIdentity(
+  metadata: Record<string, unknown> | undefined,
+): { sandboxUid: string; podUid: string } {
+  const sandboxUid = metadata?.sandboxUid;
+  const podUid = metadata?.podUid;
+  if (
+    typeof sandboxUid !== "string" || !sandboxUid.trim() ||
+    typeof podUid !== "string" || !podUid.trim()
+  ) {
+    throw new Error(
+      "Kubernetes sandbox lease is missing its persisted Sandbox/Pod UIDs; reacquire the lease.",
+    );
+  }
+  return { sandboxUid, podUid };
+}
+
+async function resolveSandboxLeasePod(
+  clients: ReturnType<typeof makeKubeClients>,
+  namespace: string,
+  sandboxName: string,
+  expectedSandboxUid: string,
+  expectedPodUid: string,
+) {
+  const identity = await getSandboxPodIdentity(
+    clients,
+    namespace,
+    sandboxName,
+    expectedSandboxUid,
+  );
+  if (!identity) {
+    throw new Error(
+      `Sandbox ${namespace}/${sandboxName} has no owned Pod with a UID; reacquire the Kubernetes lease.`,
+    );
+  }
+  if (identity.uid !== expectedPodUid) {
+    throw new Error(
+      `Sandbox Pod ${namespace}/${identity.name} was recreated (expected Pod UID ${expectedPodUid}, found ${identity.uid}); reacquire the Kubernetes lease.`,
+    );
+  }
+  return identity;
+}
+
 /**
  * Resolve the running Sandbox-CR pod for a native file-sync operation and return
  * a `PodStreamExec` bound to it, exactly like `onEnvironmentExecute` resolves its exec
@@ -179,6 +238,17 @@ async function resolveSyncPodExec(
   });
   const clients = makeKubeClients(kc);
   const timeoutMs = config.podActivityDeadlineSec * 1000;
+  const { sandboxUid, podUid } = requireSandboxLeaseIdentity(lease.metadata);
+
+  // Cached readiness never bypasses the immutable CR/Pod identity checks. This
+  // also rejects a same-name replacement before any sync reads or writes files.
+  await resolveSandboxLeasePod(
+    clients,
+    namespace,
+    lease.providerLeaseId,
+    sandboxUid,
+    podUid,
+  );
 
   // Ensure the Sandbox pod is Ready (wait only the first time for this lease),
   // then resolve the pod name — mirrors the onEnvironmentExecute resolution.
@@ -190,12 +260,17 @@ async function resolveSyncPodExec(
     readySandboxesByLease.add(lease.providerLeaseId);
   }
 
-  const podName =
-    typeof lease.metadata?.podName === "string" && lease.metadata.podName
-      ? lease.metadata.podName
-      : await sandboxCrOrchestrator.findPod(clients, namespace, lease.providerLeaseId);
-  if (!podName) {
-    throw new Error("Kubernetes file sync could not resolve the Sandbox pod name.");
+  const identity = await resolveSandboxLeasePod(
+    clients,
+    namespace,
+    lease.providerLeaseId,
+    sandboxUid,
+    podUid,
+  );
+  if (identity.phase !== "Running" || identity.terminating) {
+    throw new Error(
+      `Kubernetes Sandbox pod ${identity.name} is ${identity.terminating ? "terminating" : identity.phase ?? "in an unknown phase"}; file sync requires a Running pod.`,
+    );
   }
 
   // Bind the streaming exec: raw tar bytes move over stdin/stdout straight to and
@@ -203,10 +278,17 @@ async function resolveSyncPodExec(
   // module bounds the untrusted pod's stdout with its own streamed-bytes disk
   // guard and passes the stderr cap through `io`.
   const exec: PodStreamExec = (command, io) =>
-    execInPodStreaming(kc, namespace, podName, "agent", command, {
+    execInPodStreaming(
+      kc,
+      namespace,
+      identity.name,
+      "agent",
+      wrapCommandWithPodUid(command, undefined, podUid),
+      {
       ...io,
       timeoutMs: io.timeoutMs ?? timeoutMs,
-    });
+      },
+    );
   return { exec, timeoutMs };
 }
 
@@ -310,6 +392,12 @@ const plugin = definePlugin({
   ): Promise<PluginEnvironmentLease> {
     const config = kubernetesProviderConfigSchema.parse(params.config);
     const namespace = deriveTenantNamespace(config, params.companyId);
+    // Validate caller deadlines before tenant provisioning. Resolve again just
+    // before the claim below so time spent provisioning cannot make the CR's
+    // shutdownTime stale or later than the caller requested.
+    if (config.backend === "sandbox-cr") {
+      resolveSandboxShutdownTime(config.sandboxLifetimeSec, params.requestedExpiresAt);
+    }
 
     // The adapter for THIS run is the agent's adapter (params.adapterType) when
     // supplied, so one environment can serve mixed harnesses; otherwise fall back
@@ -378,11 +466,16 @@ const plugin = definePlugin({
     // Pick the orchestrator and build the appropriate manifest based on backend.
     const isSandboxCrBackend = config.backend === "sandbox-cr";
     const orchestrator = isSandboxCrBackend ? sandboxCrOrchestrator : jobOrchestrator;
+    const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
+    const shutdownTime = isSandboxCrBackend
+      ? resolveSandboxShutdownTime(config.sandboxLifetimeSec, params.requestedExpiresAt)
+      : undefined;
 
     const manifest = isSandboxCrBackend
       ? buildSandboxCrManifest({
           namespace,
           sandboxName: jobName,
+          shutdownTime: shutdownTime!,
           adapterType: effectiveAdapterType,
           image,
           envSecretName: secretName,
@@ -408,76 +501,208 @@ const plugin = definePlugin({
           imagePullSecrets: config.imagePullSecrets,
         });
 
-    const { uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest);
-    const scopedNetworkEgress = parseScopedNetworkEgressGrant(params.executionWorkspaceSettings);
-    const scopedNetworkPolicyName = await createScopedNetworkEgressPolicyOrReleaseWorkload(
-      {
-        clients,
-        namespace,
-        mode: config.egressMode,
-        runId: params.runId,
-        workloadName: jobName,
-        ownerReference: {
-          apiVersion: isSandboxCrBackend ? SANDBOX_API_VERSION : "batch/v1",
-          kind: isSandboxCrBackend ? "Sandbox" : "Job",
+    let ownerUid: string;
+    try {
+      ({ uid: ownerUid } = await orchestrator.claim(clients, namespace, manifest));
+    } catch (claimError) {
+      // If create succeeded but its response was lost or lacked a UID, recover
+      // only when a GET proves this uniquely named CR carries this run's label.
+      // This avoids leaving an orphan while refusing to delete a collision.
+      if (!isSandboxCrBackend) throw claimError;
+      const cleanupErrors: unknown[] = [];
+      try {
+        const cr = await clients.custom.getNamespacedCustomObject({
+          group: "agents.x-k8s.io",
+          version: "v1beta1",
+          namespace,
+          plural: "sandboxes",
           name: jobName,
-          uid: ownerUid,
-          controller: false,
-          blockOwnerDeletion: false,
+        }) as Record<string, unknown>;
+        const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+        const labels = (metadata.labels as Record<string, unknown>) ?? {};
+        const recoveredUid = metadata.uid;
+        if (
+          typeof recoveredUid === "string" && recoveredUid &&
+          labels["paperclip.io/run-id"] === params.runId
+        ) {
+          let recoveredPodName: string | null = null;
+          try {
+            recoveredPodName = await sandboxCrOrchestrator.findPod(
+              clients,
+              namespace,
+              jobName,
+              recoveredUid,
+            );
+          } catch (lookupError) {
+            if (!isKubeNotFoundError(lookupError)) cleanupErrors.push(lookupError);
+          }
+          try {
+            await destroyLeaseResources(clients, {
+              namespace,
+              name: jobName,
+              backend: "sandbox-cr",
+              podName: recoveredPodName,
+              secretName: null,
+              expectedSandboxUid: recoveredUid,
+            });
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+      } catch (lookupError) {
+        if (!isKubeNotFoundError(lookupError)) cleanupErrors.push(lookupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [claimError, ...cleanupErrors],
+          "Kubernetes Sandbox claim failed and cleanup was incomplete",
+        );
+      }
+      throw claimError;
+    }
+    let podName: string | null = null;
+    let secretUid: string | null = null;
+    let scopedNetworkPolicyName: string | null = null;
+    try {
+      scopedNetworkPolicyName = await createScopedNetworkEgressPolicyOrReleaseWorkload(
+        {
+          clients,
+          namespace,
+          mode: config.egressMode,
+          runId: params.runId,
+          workloadName: jobName,
+          ownerReference: {
+            apiVersion: isSandboxCrBackend ? SANDBOX_API_VERSION : "batch/v1",
+            kind: isSandboxCrBackend ? "Sandbox" : "Job",
+            name: jobName,
+            uid: ownerUid,
+            controller: false,
+            blockOwnerDeletion: false,
         },
         grant: scopedNetworkEgress,
       },
-      () => orchestrator.release(clients, namespace, jobName),
-    );
+      () => isSandboxCrBackend
+        ? deleteSandboxCrIfUid(clients, namespace, jobName, ownerUid)
+        : orchestrator.release(clients, namespace, jobName),
+      );
 
-    // defaultEnv (non-secret base, e.g. the inference base URL) is layered first;
-    // the process-env secrets named by envKeys override it.
-    const adapterEnv = buildAdapterEnv(adapterDefaults);
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_POLICY = "kubernetes-default-deny";
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_GRANT_PATH = NETWORK_EGRESS_GRANT_PATH;
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_FQDNS = scopedNetworkEgress.allowFqdns.join(",");
-    adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_CIDRS = scopedNetworkEgress.allowCidrs.join(",");
-    const bootstrapToken = generateBootstrapToken();
+      // defaultEnv (non-secret base, e.g. the inference base URL) is layered first;
+      // the process-env secrets named by envKeys override it.
+      const adapterEnv = buildAdapterEnv(adapterDefaults);
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_POLICY = "kubernetes-default-deny";
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_GRANT_PATH = NETWORK_EGRESS_GRANT_PATH;
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_FQDNS = scopedNetworkEgress.allowFqdns.join(",");
+      adapterEnv.PAPERCLIP_NETWORK_EGRESS_ALLOW_CIDRS = scopedNetworkEgress.allowCidrs.join(",");
+      const bootstrapToken = generateBootstrapToken();
 
-    // Secret ownerRef: for job backend, the Job owns the Secret (cascade delete).
-    // For sandbox-cr backend, the Sandbox CR owns the Secret.
-    // NOTE: For sandbox-cr, if the Secret outlives the Sandbox due to a cluster
-    // quirk, the release() call will still clean it up via namespace GC or
-    // explicit delete in a future iteration.
-    await createPerRunSecret(clients, {
-      namespace,
-      secretName,
-      runId: params.runId,
-      ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
-      ownerApiVersion: isSandboxCrBackend ? SANDBOX_API_VERSION : "batch/v1",
-      ownerName: jobName,
-      ownerUid,
-      bootstrapToken,
-      adapterEnv,
-    });
+      secretUid = await createPerRunSecret(clients, {
+        namespace,
+        secretName,
+        runId: params.runId,
+        ownerKind: isSandboxCrBackend ? "Sandbox" : "Job",
+        ownerApiVersion: isSandboxCrBackend ? SANDBOX_API_VERSION : "batch/v1",
+        ownerName: jobName,
+        ownerUid,
+        bootstrapToken,
+        adapterEnv,
+      });
+      if (isSandboxCrBackend && !secretUid) {
+        throw new Error("Kubernetes per-run Secret was created without a UID");
+      }
 
-    const podName = await orchestrator.findPod(clients, namespace, jobName);
+      let sandboxUid: string | undefined;
+      let podUid: string | undefined;
+      if (isSandboxCrBackend) {
+        sandboxUid = ownerUid;
+        const identity = await waitForSandboxPodIdentity(
+          clients,
+          namespace,
+          jobName,
+          sandboxUid,
+          { timeoutMs: 10_000, pollMs: 200 },
+        );
+        podName = identity.name;
+        podUid = identity.uid;
+      } else {
+        podName = await orchestrator.findPod(clients, namespace, jobName);
+      }
 
-    const leaseMetadata: KubernetesLeaseMetadata = {
-      namespace,
-      jobName,
-      podName,
-      secretName,
-      phase: "Pending",
-      backend: config.backend,
-      remoteCwd: DEFAULT_WORKSPACE_REMOTE_DIR,
-      scopedNetworkPolicyName,
-      scopedNetworkEgress,
-      // Native file sync streams over a pod exec; only the sandbox-cr backend
-      // exposes one. Flag the job backend so the server keeps the base64 fallback
-      // rather than routing its sync to a hook that would reject immediately.
-      nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
-    };
+      if (shutdownTime && Date.parse(shutdownTime) <= Date.now()) {
+        throw new Error(
+          "Kubernetes Sandbox lease expired while it was being acquired; retry with a later requestedExpiresAt or longer sandboxLifetimeSec.",
+        );
+      }
 
-    return {
-      providerLeaseId: jobName,
-      metadata: leaseMetadata as unknown as Record<string, unknown>,
-    };
+      const leaseMetadata: KubernetesLeaseMetadata = {
+        namespace,
+        jobName,
+        podName,
+        secretName,
+        ...(sandboxUid && secretUid ? { secretUid } : {}),
+        ...(sandboxUid ? { sandboxUid } : {}),
+        ...(podUid ? { podUid } : {}),
+        phase: "Pending",
+        backend: config.backend,
+        remoteCwd: DEFAULT_WORKSPACE_REMOTE_DIR,
+        scopedNetworkPolicyName,
+        scopedNetworkEgress,
+        // Native file sync streams over a pod exec; only the sandbox-cr backend
+        // exposes one. Flag the job backend so the server keeps the base64 fallback
+        // rather than routing its sync to a hook that would reject immediately.
+        nativeFileSyncUnsupported: config.backend !== "sandbox-cr",
+      };
+
+      return {
+        providerLeaseId: jobName,
+        ...(shutdownTime ? { expiresAt: shutdownTime } : {}),
+        metadata: leaseMetadata as unknown as Record<string, unknown>,
+      };
+    } catch (acquireError) {
+      const cleanupErrors: unknown[] = [];
+      if (
+        isSandboxCrBackend &&
+        !podName &&
+        !(acquireError instanceof SandboxPodIdentityTimeoutError)
+      ) {
+        try {
+          podName = await sandboxCrOrchestrator.findPod(
+            clients,
+            namespace,
+            jobName,
+            ownerUid,
+          );
+        } catch (lookupError) {
+          // Scoped-policy setup may already have released the claimed CR.
+          // Its missing Pod is expected and must not mask the original error
+          // as an incomplete cleanup.
+          if (!isKubeNotFoundError(lookupError)) cleanupErrors.push(lookupError);
+        }
+      }
+      try {
+        await destroyLeaseResources(clients, {
+          namespace,
+          name: jobName,
+          backend: config.backend,
+          podName,
+          secretName: isSandboxCrBackend && !secretUid ? null : secretName,
+          ...(isSandboxCrBackend
+            ? {
+                expectedSandboxUid: ownerUid,
+                ...(secretUid ? { expectedSecretUid: secretUid } : {}),
+              }
+            : {}),
+        });
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          [acquireError, ...cleanupErrors],
+          "Kubernetes lease acquisition failed and cleanup was incomplete",
+        );
+      }
+      throw acquireError;
+    }
   },
 
   async onEnvironmentResumeLease(
@@ -511,6 +736,14 @@ const plugin = definePlugin({
       backend: leaseBackend,
       readyTimeoutMs: RESUME_READY_TIMEOUT_MS,
       pollMs: RESUME_READY_POLL_MS,
+      expectedSandboxUid:
+        typeof params.leaseMetadata?.sandboxUid === "string"
+          ? params.leaseMetadata.sandboxUid
+          : undefined,
+      expectedPodUid:
+        typeof params.leaseMetadata?.podUid === "string"
+          ? params.leaseMetadata.podUid
+          : undefined,
     });
 
     if (!check.resumable) {
@@ -539,6 +772,11 @@ const plugin = definePlugin({
       jobName: params.providerLeaseId,
       podName: check.podName,
       secretName,
+      ...(typeof params.leaseMetadata?.secretUid === "string"
+        ? { secretUid: params.leaseMetadata.secretUid }
+        : {}),
+      ...(check.sandboxUid ? { sandboxUid: check.sandboxUid } : {}),
+      ...(check.podUid ? { podUid: check.podUid } : {}),
       phase: check.phase,
       backend: leaseBackend,
       remoteCwd: resolveWorkspaceRemoteDir(params.leaseMetadata?.remoteCwd),
@@ -556,6 +794,7 @@ const plugin = definePlugin({
 
     return {
       providerLeaseId: params.providerLeaseId,
+      ...(check.expiresAt ? { expiresAt: check.expiresAt } : {}),
       metadata: {
         ...leaseMetadata,
         resumedLease: true,
@@ -612,12 +851,30 @@ const plugin = definePlugin({
     readySandboxesByLease.delete(params.providerLeaseId);
 
     try {
-      await releaseOrchestrator.release(clients, namespace, params.providerLeaseId);
+      if (
+        leaseBackend === "sandbox-cr" &&
+        typeof params.leaseMetadata?.sandboxUid === "string" &&
+        params.leaseMetadata.sandboxUid
+      ) {
+        await deleteSandboxCrIfUid(
+          clients,
+          namespace,
+          params.providerLeaseId,
+          params.leaseMetadata.sandboxUid,
+        );
+      } else {
+        // Preserve existing cleanup for Job and pre-identity legacy leases.
+        await releaseOrchestrator.release(clients, namespace, params.providerLeaseId);
+      }
     } catch (err) {
       // If the resource is already gone (404), that's fine.
       const code = (err as { code?: number; statusCode?: number }).code
         ?? (err as { code?: number; statusCode?: number }).statusCode;
-      if (code !== 404) throw err;
+      if (
+        code !== 404 &&
+        !isKubeUidPreconditionConflictError(err) &&
+        !(err instanceof SandboxIdentityMismatchError)
+      ) throw err;
     }
   },
 
@@ -663,6 +920,15 @@ const plugin = definePlugin({
       backend: leaseBackend,
       podName,
       secretName,
+      ...(typeof params.leaseMetadata?.sandboxUid === "string"
+        ? { expectedSandboxUid: params.leaseMetadata.sandboxUid }
+        : {}),
+      ...(typeof params.leaseMetadata?.podUid === "string"
+        ? { expectedPodUid: params.leaseMetadata.podUid }
+        : {}),
+      ...(typeof params.leaseMetadata?.secretUid === "string"
+        ? { expectedSecretUid: params.leaseMetadata.secretUid }
+        : {}),
     });
   },
 
@@ -712,10 +978,32 @@ const plugin = definePlugin({
       // 2. Exec the command into the running pod.
       // 3. Return exec result directly (no log scraping needed).
 
-      let podName =
-        typeof lease.metadata?.podName === "string" && lease.metadata.podName
-          ? lease.metadata.podName
-          : null;
+      let sandboxUid: string;
+      let podUid: string;
+      try {
+        ({ sandboxUid, podUid } = requireSandboxLeaseIdentity(lease.metadata));
+        // This check runs on every exec, including when readiness is cached.
+        await resolveSandboxLeasePod(
+          clients,
+          namespace,
+          lease.providerLeaseId,
+          sandboxUid,
+          podUid,
+        );
+      } catch (err) {
+        return {
+          exitCode: 1,
+          timedOut: false,
+          stdout: "",
+          stderr: err instanceof Error ? err.message : String(err),
+          metadata: {
+            provider: "kubernetes",
+            backend: "sandbox-cr",
+            namespace,
+            sandboxName: lease.providerLeaseId,
+          },
+        };
+      }
 
       // Skip the readiness poll if we've already observed this Sandbox CR
       // reaching Ready during this worker's lifetime. See readySandboxesByLease
@@ -755,21 +1043,23 @@ const plugin = definePlugin({
         }
       }
 
-      // Resolve pod name (may now be populated in Sandbox status).
-      if (!podName) {
-        podName = await sandboxCrOrchestrator.findPod(
+      let podIdentity;
+      try {
+        // Recheck both immutable UIDs after readiness and immediately before
+        // building the guarded exec command.
+        podIdentity = await resolveSandboxLeasePod(
           clients,
           namespace,
           lease.providerLeaseId,
+          sandboxUid,
+          podUid,
         );
-      }
-
-      if (!podName) {
+      } catch (err) {
         return {
           exitCode: 1,
           timedOut: false,
           stdout: "",
-          stderr: "Sandbox pod is Ready but podName could not be resolved.",
+          stderr: err instanceof Error ? err.message : String(err),
           metadata: {
             provider: "kubernetes",
             backend: "sandbox-cr",
@@ -778,6 +1068,21 @@ const plugin = definePlugin({
           },
         };
       }
+      if (podIdentity.phase !== "Running" || podIdentity.terminating) {
+        return {
+          exitCode: 1,
+          timedOut: false,
+          stdout: "",
+          stderr: `Kubernetes Sandbox pod ${podIdentity.name} is ${podIdentity.terminating ? "terminating" : podIdentity.phase ?? "in an unknown phase"}; execution requires a Running pod.`,
+          metadata: {
+            provider: "kubernetes",
+            backend: "sandbox-cr",
+            namespace,
+            sandboxName: lease.providerLeaseId,
+          },
+        };
+      }
+      const podName = podIdentity.name;
 
       // Build the command to exec. The adapter passes shell invocations as
       // `command: "sh", args: ["-c", "<script>"]` — must combine both, NOT
@@ -840,7 +1145,7 @@ const plugin = definePlugin({
               namespace,
               podName,
               "agent",
-              ["/bin/sh", "-c", script],
+              wrapCommandWithPodUid(["/bin/sh", "-c", script], undefined, podUid),
               base64Body,
               flushTimeoutMs,
             );
@@ -891,7 +1196,7 @@ const plugin = definePlugin({
       // OpenCode config, plus helper settings like small_model/provider routing) never
       // reaches the harness, which falls back to its in-image HOME config -> wrong or
       // partial behaviour.
-      const execCommand = wrapCommandWithEnv(baseExecCommand, params.env);
+      const execCommand = wrapCommandWithPodUid(baseExecCommand, params.env, podUid);
 
       // Remaining share of the caller's budget after the readiness wait (floor
       // of 5s so an exec attempt is still made when readiness consumed most of

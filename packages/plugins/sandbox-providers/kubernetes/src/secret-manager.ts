@@ -12,14 +12,14 @@ export interface CreatePerRunSecretInput {
   adapterEnv: Record<string, string>;
 }
 
-export async function createPerRunSecret(clients: KubeClients, input: CreatePerRunSecretInput): Promise<void> {
+export async function createPerRunSecret(clients: KubeClients, input: CreatePerRunSecretInput): Promise<string | null> {
   if (!input.ownerUid) {
     throw new Error("createPerRunSecret requires a non-empty ownerUid");
   }
   if ("BOOTSTRAP_TOKEN" in input.adapterEnv) {
     throw new Error("adapterEnv must not contain BOOTSTRAP_TOKEN (reserved key)");
   }
-  await clients.core.createNamespacedSecret({
+  const created = await clients.core.createNamespacedSecret({
     namespace: input.namespace,
     body: {
       apiVersion: "v1",
@@ -49,4 +49,6 @@ export async function createPerRunSecret(clients: KubeClients, input: CreatePerR
       },
     },
   });
+  const uid = (created as { metadata?: { uid?: unknown } } | undefined)?.metadata?.uid;
+  return typeof uid === "string" && uid.trim() ? uid : null;
 }

@@ -4,6 +4,9 @@ import {
   deleteSandboxCr,
   getSandboxCrStatus,
   findPodForSandbox,
+  getSandboxPodIdentity,
+  waitForSandboxPodIdentity,
+  SandboxIdentityMismatchError,
   SandboxCrTimeoutError,
   waitForSandboxReady,
 } from "../../src/sandbox-cr-orchestrator.js";
@@ -57,12 +60,20 @@ function makeCr(input: {
 
 function ownedPod(
   name: string,
-  options: { uid?: string; controller?: boolean; phase?: string } = {},
+  options: {
+    uid?: string;
+    podUid?: string;
+    controller?: boolean;
+    phase?: string;
+    deletionTimestamp?: string;
+  } = {},
 ): Record<string, unknown> {
   return {
     metadata: {
       name,
+      uid: options.podUid ?? "pod-uid-123",
       labels: { "agents.x-k8s.io/sandbox-name-hash": "1a2b3c" },
+      ...(options.deletionTimestamp ? { deletionTimestamp: options.deletionTimestamp } : {}),
       ownerReferences: [
         {
           apiVersion: SANDBOX_API_VERSION,
@@ -264,6 +275,18 @@ describe("findPodForSandbox", () => {
     expect(list).not.toHaveBeenCalled();
   });
 
+  it("rejects a same-name replacement Sandbox against the persisted UID", async () => {
+    const clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(makeCr({ uid: "replacement-uid" })),
+      },
+      core: { readNamespacedPod: vi.fn() },
+    };
+    await expect(
+      findPodForSandbox(clients as never, "ns", SANDBOX_NAME, SANDBOX_UID),
+    ).rejects.toBeInstanceOf(SandboxIdentityMismatchError);
+  });
+
   it("propagates non-404 errors from exact Pod lookup", async () => {
     const get = vi.fn().mockResolvedValue(makeCr());
     const read = vi.fn().mockRejectedValue({ code: 403, message: "forbidden" });
@@ -275,6 +298,83 @@ describe("findPodForSandbox", () => {
     await expect(findPodForSandbox(clients as never, "ns", SANDBOX_NAME)).rejects.toMatchObject({
       code: 403,
     });
+  });
+});
+
+describe("waitForSandboxPodIdentity", () => {
+  it("returns an owned Pending Pod identity without waiting for Ready", async () => {
+    const clients = {
+      custom: { getNamespacedCustomObject: vi.fn().mockResolvedValue(makeCr()) },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue(
+          ownedPod(SANDBOX_NAME, { phase: "Pending", podUid: "pod-pending-uid" }),
+        ),
+      },
+    };
+
+    await expect(
+      waitForSandboxPodIdentity(clients as never, "ns", SANDBOX_NAME, SANDBOX_UID, {
+        timeoutMs: 100,
+        pollMs: 10,
+      }),
+    ).resolves.toEqual({
+      name: SANDBOX_NAME,
+      uid: "pod-pending-uid",
+      phase: "Pending",
+      terminating: false,
+    });
+  });
+
+  it("times out while waiting for an owned Pod UID without a real ten-second wait", async () => {
+    vi.useFakeTimers();
+    try {
+      const clients = {
+        custom: { getNamespacedCustomObject: vi.fn().mockResolvedValue(makeCr()) },
+        core: {
+          readNamespacedPod: vi.fn().mockRejectedValue(Object.assign(new Error("gone"), { code: 404 })),
+        },
+      };
+      const waiting = waitForSandboxPodIdentity(
+        clients as never,
+        "ns",
+        SANDBOX_NAME,
+        SANDBOX_UID,
+        { timeoutMs: 100, pollMs: 50 },
+      );
+      const rejected = expect(waiting).rejects.toThrow(
+        /did not produce an owned Pod with a UID within 100ms/,
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not capture a terminating Pod as a new lease identity", async () => {
+    vi.useFakeTimers();
+    try {
+      const clients = {
+        custom: { getNamespacedCustomObject: vi.fn().mockResolvedValue(makeCr()) },
+        core: {
+          readNamespacedPod: vi.fn().mockResolvedValue(ownedPod(SANDBOX_NAME, {
+            deletionTimestamp: "2026-10-01T00:00:00Z",
+          })),
+        },
+      };
+      const waiting = waitForSandboxPodIdentity(
+        clients as never,
+        "ns",
+        SANDBOX_NAME,
+        SANDBOX_UID,
+        { timeoutMs: 100, pollMs: 50 },
+      );
+      const rejected = expect(waiting).rejects.toThrow(/did not produce an owned Pod with a UID/);
+      await vi.advanceTimersByTimeAsync(100);
+      await rejected;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

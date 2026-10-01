@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import {
   checkLeaseResumable,
   destroyLeaseResources,
+  isKubeUidPreconditionConflictError,
   isKubeNotFoundError,
 } from "../../src/lease-lifecycle.js";
 
@@ -9,6 +10,11 @@ const SANDBOX_GROUP = "agents.x-k8s.io";
 const SANDBOX_VERSION = "v1beta1";
 const SANDBOX_API_VERSION = `${SANDBOX_GROUP}/${SANDBOX_VERSION}`;
 const SANDBOX_PLURAL = "sandboxes";
+const SANDBOX_SHUTDOWN_TIME = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+const EXPECTED_SANDBOX_IDENTITY = {
+  expectedSandboxUid: "uid-1",
+  expectedPodUid: "pod-uid-1",
+};
 
 function notFound(): Error {
   return Object.assign(new Error("not found"), { code: 404 });
@@ -21,6 +27,7 @@ function readySandboxCr(podName?: string): Record<string, unknown> {
       generation: 1,
       ...(podName ? { annotations: { "agents.x-k8s.io/pod-name": podName } } : {}),
     },
+    spec: { shutdownTime: SANDBOX_SHUTDOWN_TIME, shutdownPolicy: "Delete" },
     status: {
       conditions: [
         {
@@ -39,6 +46,7 @@ function sandboxOwnedPod(name: string, extraMetadata: Record<string, unknown> = 
   return {
     metadata: {
       name,
+      uid: "pod-uid-1",
       ...extraMetadata,
       ownerReferences: [
         {
@@ -66,6 +74,24 @@ describe("isKubeNotFoundError", () => {
   });
 });
 
+describe("isKubeUidPreconditionConflictError", () => {
+  it("matches UID precondition conflicts and excludes generic conflicts", () => {
+    expect(isKubeUidPreconditionConflictError({
+      code: 409,
+      message: "UID precondition failed: expected old UID",
+    })).toBe(true);
+    expect(isKubeUidPreconditionConflictError({
+      code: 409,
+      body: { message: "Precondition failed: UID in precondition does not match" },
+    })).toBe(true);
+    expect(isKubeUidPreconditionConflictError({
+      code: 409,
+      message: "resource version conflict",
+    })).toBe(false);
+    expect(isKubeUidPreconditionConflictError({ code: 403, message: "forbidden" })).toBe(false);
+  });
+});
+
 describe("checkLeaseResumable (sandbox-cr backend)", () => {
   it("resumes a live lease whose Sandbox is Ready and pod is Running", async () => {
     const clients = {
@@ -80,10 +106,18 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       namespace: "paperclip-acme",
       name: "pc-abc",
       backend: "sandbox-cr",
+      ...EXPECTED_SANDBOX_IDENTITY,
       readyTimeoutMs: 1_000,
       pollMs: 10,
     });
-    expect(result).toEqual({ resumable: true, podName: "pc-abc-pod", phase: "Running" });
+    expect(result).toEqual({
+      resumable: true,
+      podName: "pc-abc-pod",
+      phase: "Running",
+      sandboxUid: "uid-1",
+      podUid: "pod-uid-1",
+      expiresAt: SANDBOX_SHUTDOWN_TIME,
+    });
     expect(clients.core.readNamespacedPod).toHaveBeenCalledWith({
       namespace: "paperclip-acme",
       name: "pc-abc-pod",
@@ -99,6 +133,7 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       namespace: "ns",
       name: "pc-abc",
       backend: "sandbox-cr",
+      ...EXPECTED_SANDBOX_IDENTITY,
       readyTimeoutMs: 1_000,
       pollMs: 10,
     });
@@ -124,12 +159,13 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
           },
         }),
       },
-      core: { readNamespacedPod: vi.fn() },
+      core: { readNamespacedPod: vi.fn().mockRejectedValue(notFound()) },
     };
     const result = await checkLeaseResumable(clients as never, {
       namespace: "ns",
       name: "pc-abc",
       backend: "sandbox-cr",
+      ...EXPECTED_SANDBOX_IDENTITY,
       readyTimeoutMs: 1_000,
       pollMs: 10,
     });
@@ -154,12 +190,13 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
           },
         }),
       },
-      core: { readNamespacedPod: vi.fn() },
+      core: { readNamespacedPod: vi.fn().mockRejectedValue(notFound()) },
     };
     const result = await checkLeaseResumable(clients as never, {
       namespace: "ns",
       name: "pc-abc",
       backend: "sandbox-cr",
+      ...EXPECTED_SANDBOX_IDENTITY,
       readyTimeoutMs: 30,
       pollMs: 5,
     });
@@ -181,11 +218,12 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       namespace: "ns",
       name: "pc-abc",
       backend: "sandbox-cr",
+      ...EXPECTED_SANDBOX_IDENTITY,
       readyTimeoutMs: 1_000,
       pollMs: 10,
     });
     expect(result.resumable).toBe(false);
-    if (!result.resumable) expect(result.reason).toMatch(/no backing pod was found/);
+    if (!result.resumable) expect(result.reason).toMatch(/no owned Pod with a UID/);
   });
 
   it("is not resumable when the pod is being torn down (deletionTimestamp set)", async () => {
@@ -205,6 +243,7 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
       namespace: "ns",
       name: "pc-abc",
       backend: "sandbox-cr",
+      ...EXPECTED_SANDBOX_IDENTITY,
       readyTimeoutMs: 1_000,
       pollMs: 10,
     });
@@ -228,6 +267,7 @@ describe("checkLeaseResumable (sandbox-cr backend)", () => {
         namespace: "ns",
         name: "pc-abc",
         backend: "sandbox-cr",
+        ...EXPECTED_SANDBOX_IDENTITY,
         readyTimeoutMs: 1_000,
         pollMs: 10,
       }),
@@ -390,5 +430,68 @@ describe("destroyLeaseResources", () => {
         secretName: null,
       }),
     ).rejects.toThrow("forbidden");
+  });
+
+  it("treats UID-precondition races during guarded cleanup as safe no-ops", async () => {
+    const conflict = Object.assign(new Error("UID precondition failed"), { code: 409 });
+    const clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue({ metadata: { uid: "uid-1" } }),
+        deleteNamespacedCustomObject: vi.fn().mockRejectedValue(conflict),
+      },
+      batch: { deleteNamespacedJob: vi.fn() },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue({
+          metadata: {
+            uid: "pod-uid-1",
+            ownerReferences: [{
+              apiVersion: SANDBOX_API_VERSION,
+              kind: "Sandbox",
+              name: "pc-abc",
+              uid: "uid-1",
+              controller: true,
+            }],
+          },
+        }),
+        deleteNamespacedPod: vi.fn().mockRejectedValue(conflict),
+        deleteNamespacedSecret: vi.fn().mockRejectedValue(conflict),
+      },
+    };
+    await expect(destroyLeaseResources(clients as never, {
+      namespace: "ns",
+      name: "pc-abc",
+      backend: "sandbox-cr",
+      podName: "pc-abc-pod",
+      secretName: "pc-abc-env",
+      expectedSandboxUid: "uid-1",
+      expectedPodUid: "pod-uid-1",
+      expectedSecretUid: "secret-uid-1",
+    })).resolves.toBeUndefined();
+    expect(clients.core.readNamespacedPod).toHaveBeenCalledOnce();
+    expect(clients.core.deleteNamespacedSecret).toHaveBeenCalledWith({
+      namespace: "ns",
+      name: "pc-abc-env",
+      body: { preconditions: { uid: "secret-uid-1" } },
+    });
+  });
+
+  it("does not suppress a generic 409 during guarded cleanup", async () => {
+    const conflict = Object.assign(new Error("resource version conflict"), { code: 409 });
+    const clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue({ metadata: { uid: "uid-1" } }),
+        deleteNamespacedCustomObject: vi.fn().mockRejectedValue(conflict),
+      },
+      batch: { deleteNamespacedJob: vi.fn() },
+      core: { readNamespacedPod: vi.fn(), deleteNamespacedPod: vi.fn(), deleteNamespacedSecret: vi.fn() },
+    };
+    await expect(destroyLeaseResources(clients as never, {
+      namespace: "ns",
+      name: "pc-abc",
+      backend: "sandbox-cr",
+      podName: null,
+      secretName: null,
+      expectedSandboxUid: "uid-1",
+    })).rejects.toThrow("resource version conflict");
   });
 });

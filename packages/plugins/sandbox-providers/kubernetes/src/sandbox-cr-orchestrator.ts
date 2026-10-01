@@ -43,6 +43,29 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export class SandboxIdentityMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SandboxIdentityMismatchError";
+  }
+}
+
+export class SandboxPodIdentityTimeoutError extends Error {
+  constructor(namespace: string, name: string, timeoutMs: number) {
+    super(
+      `Sandbox ${namespace}/${name} did not produce an owned Pod with a UID within ${timeoutMs}ms`,
+    );
+    this.name = "SandboxPodIdentityTimeoutError";
+  }
+}
+
+export interface SandboxPodIdentity {
+  name: string;
+  uid: string;
+  phase?: string;
+  terminating: boolean;
+}
+
 type SandboxCondition = {
   type?: string;
   status?: string;
@@ -252,11 +275,12 @@ export async function getSandboxCrStatus(
  * and the controller-owned Pod name normally matches the Sandbox name. Every
  * result must carry an ownerReference to this exact Sandbox UID before exec.
  */
-export async function findPodForSandbox(
+async function readOwnedSandboxPod(
   clients: KubeClients,
   namespace: string,
   name: string,
-): Promise<string | null> {
+  expectedSandboxUid?: string,
+): Promise<Record<string, unknown> | null> {
   // Read the CR once for its v1beta1 selector and UID before resolving a Pod.
   const cr = await clients.custom.getNamespacedCustomObject({
     group: SANDBOX_GROUP,
@@ -272,7 +296,19 @@ export async function findPodForSandbox(
     typeof crMetadata.uid === "string" && crMetadata.uid.trim()
       ? crMetadata.uid
       : undefined;
-  if (!sandboxUid) return null;
+  if (!sandboxUid) {
+    if (expectedSandboxUid) {
+      throw new SandboxIdentityMismatchError(
+        `Sandbox ${namespace}/${name} has no UID (expected Sandbox UID ${expectedSandboxUid}); reacquire the Kubernetes lease.`,
+      );
+    }
+    return null;
+  }
+  if (expectedSandboxUid && sandboxUid !== expectedSandboxUid) {
+    throw new SandboxIdentityMismatchError(
+      `Sandbox ${namespace}/${name} was replaced (expected Sandbox UID ${expectedSandboxUid}, found ${sandboxUid}); reacquire the Kubernetes lease.`,
+    );
+  }
   const isOwnedPod = (pod: Record<string, unknown>): boolean => {
     const podMetadata = (pod.metadata as Record<string, unknown>) ?? {};
     const ownerReferences = Array.isArray(podMetadata.ownerReferences)
@@ -325,8 +361,7 @@ export async function findPodForSandbox(
     return podStatus.phase === "Running";
   });
   const exact = runningExact ?? exactMatches[0];
-  const exactName = ((exact?.metadata as Record<string, unknown>) ?? {}).name;
-  if (typeof exactName === "string") return exactName;
+  if (exact) return exact;
 
   // v1beta1's selector is the controller-written sandbox-name-hash selector;
   // it avoids relying on the removed full-name sandbox label or name prefixes.
@@ -362,7 +397,125 @@ export async function findPodForSandbox(
   );
 
   const running = matching.find((p) => p.status?.phase === "Running");
-  return (running ?? matching[0])?.metadata?.name ?? null;
+  const found = running ?? matching[0];
+  return found ? found as unknown as Record<string, unknown> : null;
+}
+
+/**
+ * Read the currently owned Sandbox pod identity. When expectedSandboxUid is
+ * supplied, a same-name replacement Sandbox is rejected before its pod can be
+ * considered.
+ */
+export async function getSandboxPodIdentity(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  expectedSandboxUid?: string,
+): Promise<SandboxPodIdentity | null> {
+  const pod = await readOwnedSandboxPod(clients, namespace, name, expectedSandboxUid);
+  if (!pod) return null;
+  const metadata = (pod.metadata as Record<string, unknown>) ?? {};
+  const podName = metadata.name;
+  const podUid = metadata.uid;
+  if (typeof podName !== "string" || !podName.trim()) return null;
+  if (typeof podUid !== "string" || !podUid.trim()) return null;
+  const status = (pod.status as Record<string, unknown>) ?? {};
+  return {
+    name: podName,
+    uid: podUid,
+    terminating: Boolean(metadata.deletionTimestamp),
+    ...(typeof status.phase === "string" ? { phase: status.phase } : {}),
+  };
+}
+
+export async function getSandboxCrShutdownTime(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  expectedSandboxUid: string,
+): Promise<string | null> {
+  const cr = await clients.custom.getNamespacedCustomObject({
+    group: SANDBOX_GROUP,
+    version: SANDBOX_VERSION,
+    namespace,
+    plural: SANDBOX_PLURAL,
+    name,
+  }) as Record<string, unknown>;
+  const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+  const currentUid = metadata.uid;
+  if (currentUid !== expectedSandboxUid) {
+    throw new SandboxIdentityMismatchError(
+      `Sandbox ${namespace}/${name} was replaced (expected Sandbox UID ${expectedSandboxUid}, found ${String(currentUid ?? "missing")}); reacquire the Kubernetes lease.`,
+    );
+  }
+  const spec = (cr.spec as Record<string, unknown>) ?? {};
+  return spec.shutdownPolicy === "Delete" && typeof spec.shutdownTime === "string"
+    ? spec.shutdownTime
+    : null;
+}
+
+export async function assertSandboxCrUid(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  expectedSandboxUid: string,
+): Promise<void> {
+  const cr = await clients.custom.getNamespacedCustomObject({
+    group: SANDBOX_GROUP,
+    version: SANDBOX_VERSION,
+    namespace,
+    plural: SANDBOX_PLURAL,
+    name,
+  }) as Record<string, unknown>;
+  const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+  if (metadata.uid !== expectedSandboxUid) {
+    throw new SandboxIdentityMismatchError(
+      `Sandbox ${namespace}/${name} was replaced (expected Sandbox UID ${expectedSandboxUid}, found ${String(metadata.uid ?? "missing")}); reacquire the Kubernetes lease.`,
+    );
+  }
+}
+
+/** Wait only for an owned Pod identity, not controller Ready or image startup. */
+export async function waitForSandboxPodIdentity(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  expectedSandboxUid: string,
+  opts: { timeoutMs?: number; pollMs?: number } = {},
+): Promise<SandboxPodIdentity> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  const pollMs = opts.pollMs ?? 200;
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const identityOrTimeout = await Promise.race([
+      getSandboxPodIdentity(clients, namespace, name, expectedSandboxUid),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => resolve(null), remainingMs);
+      }),
+    ]).finally(() => {
+      if (timeout) clearTimeout(timeout);
+    });
+    const identity = identityOrTimeout;
+    if (identity && !identity.terminating) return identity;
+    const afterReadMs = deadline - Date.now();
+    if (afterReadMs <= 0) break;
+    await sleep(Math.min(pollMs, afterReadMs));
+  }
+  throw new SandboxPodIdentityTimeoutError(namespace, name, timeoutMs);
+}
+
+export async function findPodForSandbox(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  expectedSandboxUid?: string,
+): Promise<string | null> {
+  const pod = await readOwnedSandboxPod(clients, namespace, name, expectedSandboxUid);
+  const podName = ((pod?.metadata as Record<string, unknown>) ?? {}).name;
+  return typeof podName === "string" ? podName : null;
 }
 
 export async function streamSandboxLogs(
@@ -394,6 +547,37 @@ export async function deleteSandboxCr(
     plural: SANDBOX_PLURAL,
     name,
     propagationPolicy: "Foreground",
+  });
+}
+
+/** Delete only the exact Sandbox object backing a persisted lease. */
+export async function deleteSandboxCrIfUid(
+  clients: KubeClients,
+  namespace: string,
+  name: string,
+  expectedSandboxUid: string,
+): Promise<void> {
+  const cr = await clients.custom.getNamespacedCustomObject({
+    group: SANDBOX_GROUP,
+    version: SANDBOX_VERSION,
+    namespace,
+    plural: SANDBOX_PLURAL,
+    name,
+  }) as Record<string, unknown>;
+  const metadata = (cr.metadata as Record<string, unknown>) ?? {};
+  if (metadata.uid !== expectedSandboxUid) {
+    throw new SandboxIdentityMismatchError(
+      `Sandbox ${namespace}/${name} was replaced (expected Sandbox UID ${expectedSandboxUid}, found ${String(metadata.uid ?? "missing")}); refusing to delete the replacement.`,
+    );
+  }
+  await clients.custom.deleteNamespacedCustomObject({
+    group: SANDBOX_GROUP,
+    version: SANDBOX_VERSION,
+    namespace,
+    plural: SANDBOX_PLURAL,
+    name,
+    propagationPolicy: "Foreground",
+    body: { preconditions: { uid: expectedSandboxUid } },
   });
 }
 

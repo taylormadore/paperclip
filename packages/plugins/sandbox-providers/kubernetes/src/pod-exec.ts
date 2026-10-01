@@ -54,6 +54,47 @@ export function wrapCommandWithEnv(
   return ["/bin/sh", "-c", `${exports} exec ${command.map(shQuote).join(" ")}`];
 }
 
+/**
+ * Guard a Sandbox-CR exec against a Pod being deleted and recreated under the
+ * same name between the host UID check and the Kubernetes exec WebSocket
+ * upgrade. The expected UID and command are positional arguments, so neither
+ * is interpolated into shell source. Caller env is applied only after the guard
+ * and cannot replace the downward-API identity variable.
+ */
+export function wrapCommandWithPodUid(
+  command: string[],
+  env: Record<string, string> | undefined | null,
+  expectedPodUid: string,
+): string[] {
+  const entries = Object.entries(env && typeof env === "object" ? env : {}).filter(
+    ([key, value]) =>
+      typeof value === "string" &&
+      key !== "PATH" &&
+      key !== "PAPERCLIP_SANDBOX_POD_UID" &&
+      /^[A-Za-z_][A-Za-z0-9_]*$/.test(key),
+  );
+  const exports = entries
+    .map(([key, value]) => `export ${key}=${shQuote(value)};`)
+    .join(" ");
+  const script = [
+    'expected_pod_uid="$1"; shift;',
+    'if [ "${PAPERCLIP_SANDBOX_POD_UID:-}" != "$expected_pod_uid" ]; then',
+    '  printf \'Kubernetes pod identity mismatch: expected Pod UID %s\\n\' "$expected_pod_uid" >&2;',
+    "  exit 125;",
+    "fi;",
+    exports,
+    'exec "$@"',
+  ].filter(Boolean).join(" ");
+  return [
+    "/bin/sh",
+    "-c",
+    script,
+    "paperclip-sandbox-uid-guard",
+    expectedPodUid,
+    ...command,
+  ];
+}
+
 export async function execInPod(
   kc: KubeConfig,
   namespace: string,

@@ -46,7 +46,7 @@ npx paperclipai plugin install \
   --api-base http://127.0.0.1:3100
 ```
 
-Expected: `✓ Installed paperclip.kubernetes-sandbox-provider v0.1.0 (ready)`.
+Expected: `✓ Installed paperclip.kubernetes-sandbox-provider v0.1.0-pilot.3 (ready)`.
 
 ### 4. Create a company and a kubernetes sandbox environment
 

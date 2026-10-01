@@ -385,6 +385,7 @@ async function runSmoke(options) {
     const manifest = modules.buildSandboxCrManifest({
       namespace,
       sandboxName,
+      shutdownTime: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
       adapterType: "codex_local",
       image: options.image,
       envSecretName,

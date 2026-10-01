@@ -1,7 +1,7 @@
 ARG BASE_IMAGE=docker.io/library/alpine:3.22@sha256:3e9b4b680bfc9fb5269227cffbd6d42be39fbf7c0b908123913864aa4447e764
 FROM ${BASE_IMAGE}
 
-ARG PLUGIN_VERSION=0.1.0-pilot.2
+ARG PLUGIN_VERSION=0.1.0-pilot.3
 LABEL org.opencontainers.image.title="Paperclip Kubernetes sandbox provider plugin" \
       org.opencontainers.image.version="${PLUGIN_VERSION}" \
       org.opencontainers.image.description="Self-contained Paperclip plugin payload for init-container seeding"

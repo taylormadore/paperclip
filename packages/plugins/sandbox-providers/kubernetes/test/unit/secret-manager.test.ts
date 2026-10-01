@@ -17,9 +17,9 @@ describe("createPerRunSecret", () => {
   it("creates a Secret with the correct name and namespace", async () => {
     const created: { body: Record<string, unknown> }[] = [];
     const clients = {
-      core: { createNamespacedSecret: vi.fn(async (args: { body: Record<string, unknown> }) => { created.push(args); }) },
+      core: { createNamespacedSecret: vi.fn(async (args: { body: Record<string, unknown> }) => { created.push(args); return { metadata: { uid: "secret-uid" } }; }) },
     };
-    await createPerRunSecret(clients as never, baseInput);
+    await expect(createPerRunSecret(clients as never, baseInput)).resolves.toBe("secret-uid");
     expect(clients.core.createNamespacedSecret).toHaveBeenCalledOnce();
     const body = created[0].body as { metadata: { name: string; namespace: string } };
     expect(body.metadata.name).toBe("r-abcd-env");
@@ -29,7 +29,7 @@ describe("createPerRunSecret", () => {
   it("includes BOOTSTRAP_TOKEN and adapter env keys in stringData", async () => {
     const created: { body: Record<string, unknown> }[] = [];
     const clients = {
-      core: { createNamespacedSecret: vi.fn(async (args: { body: Record<string, unknown> }) => { created.push(args); }) },
+      core: { createNamespacedSecret: vi.fn(async (args: { body: Record<string, unknown> }) => { created.push(args); return { metadata: { uid: "secret-uid" } }; }) },
     };
     await createPerRunSecret(clients as never, baseInput);
     const body = created[0].body as { stringData: Record<string, string> };
@@ -40,7 +40,7 @@ describe("createPerRunSecret", () => {
   it("sets ownerReferences to the owner resource for cascade delete", async () => {
     const created: { body: Record<string, unknown> }[] = [];
     const clients = {
-      core: { createNamespacedSecret: vi.fn(async (args: { body: Record<string, unknown> }) => { created.push(args); }) },
+      core: { createNamespacedSecret: vi.fn(async (args: { body: Record<string, unknown> }) => { created.push(args); return { metadata: { uid: "secret-uid" } }; }) },
     };
     await createPerRunSecret(clients as never, baseInput);
     const body = created[0].body as { metadata: { ownerReferences: { uid: string; controller: boolean }[] } };
@@ -64,5 +64,10 @@ describe("createPerRunSecret", () => {
     await expect(
       createPerRunSecret(clients as never, { ...baseInput, ownerUid: "" }),
     ).rejects.toThrow(/ownerUid/);
+  });
+
+  it("returns null if the API response omits Secret metadata", async () => {
+    const clients = { core: { createNamespacedSecret: vi.fn().mockResolvedValue(undefined) } };
+    await expect(createPerRunSecret(clients as never, baseInput)).resolves.toBeNull();
   });
 });

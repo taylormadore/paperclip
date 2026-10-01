@@ -36,6 +36,8 @@ export const kubernetesProviderConfigSchema = z
 
     jobTtlSecondsAfterFinished: z.number().int().nonnegative().default(900),
     podActivityDeadlineSec: z.number().int().positive().default(3600),
+    /** Maximum lifetime of a Sandbox CR lease, independent of individual runs. */
+    sandboxLifetimeSec: z.number().int().positive().default(86400),
 
     /**
      * The adapter type that Jobs in this environment will run.
@@ -100,6 +102,11 @@ export interface KubernetesLeaseMetadata {
   /** Name of the workload resource (Job name for job backend, Sandbox CR name for sandbox-cr backend). */
   jobName: string;
   podName: string | null;
+  /** Immutable identity of the Sandbox CR and backing Pod captured at acquire. */
+  sandboxUid?: string;
+  podUid?: string;
+  /** Immutable identity of the per-run Secret for safe UID-precondition deletion. */
+  secretUid?: string;
   secretName: string;
   phase: "Pending" | "Running" | "Succeeded" | "Failed";
   /** Which backend provisioned this lease. */

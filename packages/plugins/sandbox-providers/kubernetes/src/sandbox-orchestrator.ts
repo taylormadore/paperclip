@@ -37,6 +37,7 @@ export interface SandboxOrchestrator {
     clients: KubeClients,
     namespace: string,
     name: string,
+    expectedSandboxUid?: string,
   ): Promise<string | null>;
 
   /** Read logs from the sandbox's pod. V1: post-completion read. */

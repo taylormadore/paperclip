@@ -15,11 +15,14 @@ vi.mock("@paperclipai/plugin-sdk", () => ({
 
 vi.mock("../../src/pod-exec.js", () => ({
   execInPod: vi.fn(),
+  execInPodStreaming: vi.fn(),
+  wrapCommandWithPodUid: vi.fn((command: string[]) => command),
 }));
 
 import plugin from "../../src/plugin.js";
 
 const CONFIG = { inCluster: true, backend: "sandbox-cr" };
+const SANDBOX_SHUTDOWN_TIME = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
 function leaseMetadata(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -27,6 +30,9 @@ function leaseMetadata(overrides: Record<string, unknown> = {}): Record<string, 
     jobName: "pc-abc",
     podName: "pc-abc-pod",
     secretName: "pc-abc-env",
+    sandboxUid: "uid-1",
+    podUid: "pod-uid-1",
+    secretUid: "secret-uid-1",
     phase: "Pending",
     backend: "sandbox-cr",
     ...overrides,
@@ -37,12 +43,19 @@ function notFound(): Error {
   return Object.assign(new Error("not found"), { code: 404 });
 }
 
-function readySandboxCr(podName: string): Record<string, unknown> {
+function readySandboxCr(
+  podName: string,
+  options: { uid?: string; shutdownTime?: string; shutdownPolicy?: string } = {},
+): Record<string, unknown> {
   return {
     metadata: {
-      uid: "uid-1",
+      uid: options.uid ?? "uid-1",
       generation: 1,
       annotations: { "agents.x-k8s.io/pod-name": podName },
+    },
+    spec: {
+      shutdownTime: options.shutdownTime ?? SANDBOX_SHUTDOWN_TIME,
+      shutdownPolicy: options.shutdownPolicy ?? "Delete",
     },
     status: {
       conditions: [
@@ -58,10 +71,11 @@ function readySandboxCr(podName: string): Record<string, unknown> {
   };
 }
 
-function sandboxOwnedPod(name: string) {
+function sandboxOwnedPod(name: string, podUid = "pod-uid-1") {
   return {
     metadata: {
       name,
+      uid: podUid,
       ownerReferences: [
         {
           apiVersion: "agents.x-k8s.io/v1beta1",
@@ -112,6 +126,9 @@ describe("onEnvironmentResumeLease", () => {
         jobName: "pc-abc",
         podName: "pc-abc-pod",
         secretName: "pc-abc-env",
+        sandboxUid: "uid-1",
+        podUid: "pod-uid-1",
+        secretUid: "secret-uid-1",
         phase: "Running",
         backend: "sandbox-cr",
         // Older persisted leases did not contain the root. Resume repairs them
@@ -122,6 +139,30 @@ describe("onEnvironmentResumeLease", () => {
         nativeFileSyncUnsupported: false,
       }),
     );
+    expect(lease.expiresAt).toBe(SANDBOX_SHUTDOWN_TIME);
+  });
+
+  it("returns the existing Sandbox shutdownTime unchanged when resuming", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue(sandboxOwnedPod("pc-abc-pod")),
+      },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    });
+
+    expect(lease.providerLeaseId).toBe("pc-abc");
+    expect(lease.expiresAt).toBe(SANDBOX_SHUTDOWN_TIME);
   });
 
   it("preserves a remote workspace root already recorded on a lease", async () => {
@@ -221,6 +262,100 @@ describe("onEnvironmentResumeLease", () => {
     expect(lease.providerLeaseId).toBeNull();
     expect(lease.metadata?.expired).toBe(true);
   });
+
+  it("expires a lease when the same Pod name has a replacement UID", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(readySandboxCr("pc-abc-pod")),
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue(
+          sandboxOwnedPod("pc-abc-pod", "replacement-pod-uid"),
+        ),
+      },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    });
+
+    expect(lease.providerLeaseId).toBeNull();
+    expect(lease.metadata?.reason).toMatch(/Pod pc-abc-pod was recreated/);
+  });
+
+  it("expires a lease when its Sandbox was replaced under the same name", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(
+          readySandboxCr("pc-abc-pod", { uid: "replacement-sandbox-uid" }),
+        ),
+      },
+      core: { readNamespacedPod: vi.fn() },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    });
+
+    expect(lease.providerLeaseId).toBeNull();
+    expect(lease.metadata?.reason).toMatch(/Sandbox paperclip-acme\/pc-abc was replaced/);
+  });
+
+  it("expires legacy leases missing persisted UIDs so the server reacquires them", async () => {
+    const get = vi.fn();
+    h.clients = {
+      custom: { getNamespacedCustomObject: get },
+      core: { readNamespacedPod: vi.fn() },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata({ sandboxUid: undefined, podUid: undefined }),
+    });
+
+    expect(lease.providerLeaseId).toBeNull();
+    expect(lease.metadata?.reason).toMatch(/missing its persisted Sandbox\/Pod UIDs/);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it("expires a lease when its CR does not enable shutdown deletion", async () => {
+    h.clients = {
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue(
+          readySandboxCr("pc-abc-pod", { shutdownPolicy: "Suspend" }),
+        ),
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue(sandboxOwnedPod("pc-abc-pod")),
+      },
+    };
+
+    const lease = await plugin.definition.onEnvironmentResumeLease!({
+      driverKey: "kubernetes",
+      companyId: "acme",
+      environmentId: "env-1",
+      config: CONFIG,
+      providerLeaseId: "pc-abc",
+      leaseMetadata: leaseMetadata(),
+    });
+
+    expect(lease.providerLeaseId).toBeNull();
+    expect(lease.metadata?.reason).toMatch(/shutdownTime with shutdownPolicy Delete/);
+  });
 });
 
 describe("onEnvironmentDestroyLease", () => {
@@ -229,8 +364,15 @@ describe("onEnvironmentDestroyLease", () => {
     const deletePod = vi.fn().mockResolvedValue({});
     const deleteSecret = vi.fn().mockResolvedValue({});
     h.clients = {
-      custom: { deleteNamespacedCustomObject: deleteCr },
-      core: { deleteNamespacedPod: deletePod, deleteNamespacedSecret: deleteSecret },
+      custom: {
+        getNamespacedCustomObject: vi.fn().mockResolvedValue({ metadata: { uid: "uid-1" } }),
+        deleteNamespacedCustomObject: deleteCr,
+      },
+      core: {
+        readNamespacedPod: vi.fn().mockResolvedValue(sandboxOwnedPod("pc-abc-pod")),
+        deleteNamespacedPod: deletePod,
+        deleteNamespacedSecret: deleteSecret,
+      },
       batch: { deleteNamespacedJob: vi.fn() },
     };
 
@@ -244,23 +386,29 @@ describe("onEnvironmentDestroyLease", () => {
     });
 
     expect(deleteCr).toHaveBeenCalledWith(
-      expect.objectContaining({ namespace: "paperclip-acme", name: "pc-abc" }),
+      expect.objectContaining({
+        namespace: "paperclip-acme",
+        name: "pc-abc",
+        body: { preconditions: { uid: "uid-1" } },
+      }),
     );
     expect(deletePod).toHaveBeenCalledWith({
       namespace: "paperclip-acme",
       name: "pc-abc-pod",
+      body: { preconditions: { uid: "pod-uid-1" } },
     });
     expect(deleteSecret).toHaveBeenCalledWith({
       namespace: "paperclip-acme",
       name: "pc-abc-env",
+      body: { preconditions: { uid: "secret-uid-1" } },
     });
   });
 
   it("is idempotent: resolves cleanly when every resource is already gone (404)", async () => {
     h.clients = {
-      custom: { deleteNamespacedCustomObject: vi.fn().mockRejectedValue(notFound()) },
+      custom: { getNamespacedCustomObject: vi.fn().mockRejectedValue(notFound()) },
       core: {
-        deleteNamespacedPod: vi.fn().mockRejectedValue(notFound()),
+        readNamespacedPod: vi.fn().mockRejectedValue(notFound()),
         deleteNamespacedSecret: vi.fn().mockRejectedValue(notFound()),
       },
       batch: { deleteNamespacedJob: vi.fn() },

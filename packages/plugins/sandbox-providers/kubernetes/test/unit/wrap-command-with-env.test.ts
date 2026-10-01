@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { wrapCommandWithEnv } from "../../src/pod-exec.js";
+import { wrapCommandWithEnv, wrapCommandWithPodUid } from "../../src/pod-exec.js";
 
 describe("wrapCommandWithEnv", () => {
   it("returns the command unchanged when there is no env", () => {
@@ -40,5 +40,29 @@ describe("wrapCommandWithEnv", () => {
   it("shell-escapes single quotes in values", () => {
     const out = wrapCommandWithEnv(["opencode"], { V: "a'b" });
     expect(out[2]).toContain("export V='a'\\''b';");
+  });
+});
+
+describe("wrapCommandWithPodUid", () => {
+  it("guards with positional UID and command args before applying caller env", () => {
+    const expectedUid = "pod-uid' ; echo injected";
+    const command = ["/usr/bin/agent", "argument with spaces", "x; echo command-injected"];
+    const wrapped = wrapCommandWithPodUid(
+      command,
+      {
+        PAPERCLIP_SANDBOX_POD_UID: "caller-must-not-override",
+        CUSTOM_VALUE: "caller value with ' quote",
+      },
+      expectedUid,
+    );
+    const script = wrapped[2]!;
+
+    expect(wrapped.slice(0, 2)).toEqual(["/bin/sh", "-c"]);
+    expect(wrapped.slice(4)).toEqual([expectedUid, ...command]);
+    expect(script.indexOf("if [")).toBeLessThan(script.indexOf("export CUSTOM_VALUE="));
+    expect(script).toContain('exec "$@"');
+    expect(script).not.toContain("caller-must-not-override");
+    expect(script).not.toContain(expectedUid);
+    expect(script).not.toContain("command-injected");
   });
 });

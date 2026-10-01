@@ -40,6 +40,12 @@ The plugin supports two backend modes, selected via the `backend` config field:
 
 **`sandbox-cr` (default):** Creates a `Sandbox` CR (`agents.x-k8s.io/v1beta1`) whose controller provisions a long-lived pod running `sleep infinity`. Paperclip execs individual commands into the running pod — this is the multi-command adapter-install pattern. The provider accepts Ready only when its `observedGeneration` covers the current Sandbox generation, locates the pod using the controller's `status.selector` or the warm-pool `agents.x-k8s.io/pod-name` annotation, and verifies the pod owner reference against the Sandbox UID before exec. When you `releaseLease`, the Sandbox CR is deleted and the controller tears down the pod.
 
+Each sandbox-cr lease records the Sandbox and Pod UIDs. A resumed lease is accepted only while both identities still match; if the controller recreates the Pod under the same name, Paperclip reacquires a new lease instead of treating its empty workspace as the old one. A per-lease absolute lifetime defaults to 24 hours (`sandboxLifetimeSec`) and is enforced by the agent-sandbox controller. An earlier `requestedExpiresAt` shortens that lifetime. Resume does not extend it, and expiry deletes the Sandbox and Pod even if work is active. Increase `sandboxLifetimeSec` when a deployment needs longer-running leases.
+
+After upgrading from pilot.2, existing sandbox-cr leases without persisted UIDs and a controller-enforced shutdown deadline are rejected for resume and reacquired on their next use. The old Pod may be discarded during that one-time transition.
+
+The pod's `/workspace`, `/home/paperclip`, cache, and `/tmp` directories use `emptyDir`; they disappear when the Pod is deleted or recreated. During normal execution, Paperclip copies the remote workspace changes back into the server's persistent workspace before teardown. If the server process dies before that final copyback, changes that exist only in the remote `emptyDir` can be lost.
+
 **`job` (stable fallback):** Creates a `batch/v1` Job. The container entrypoint runs once and exits — no multi-command exec possible. Use this when you cannot install agent-sandbox, or when you need strictly stable Kubernetes APIs. Note: paperclip-server's adapter-install pattern will not work in job mode.
 
 ### Migrating from `job` to `sandbox-cr`
@@ -75,7 +81,8 @@ Common optional fields:
 | `runtimeClassName` | (none) | e.g. `kata-fc` for Firecracker-backed microVMs. Cluster must have the RuntimeClass installed. |
 | `serviceAccountAnnotations` | `{}` | Annotations applied to per-tenant ServiceAccount (e.g. IRSA `eks.amazonaws.com/role-arn`). |
 | `jobTtlSecondsAfterFinished` | `900` | Seconds after a Job completes before garbage-collection. |
-| `podActivityDeadlineSec` | `3600` | Hard ceiling on a single run's wall-clock time. |
+| `podActivityDeadlineSec` | `3600` | Per-command/readiness deadline for sandbox-cr, and hard wall-clock deadline for a Job run. It does not set the sandbox-cr lease lifetime. |
+| `sandboxLifetimeSec` | `86400` | Absolute sandbox-cr lease lifetime in seconds. The controller deletes the Sandbox at expiry, including during active work. Ignored by the Job backend. |
 
 Full JSON Schema in `src/manifest.ts`.
 
@@ -194,9 +201,9 @@ npm run typecheck
 npm test
 node scripts/build-plugin-artifact.mjs --out /tmp/paperclip-kubernetes-artifact
 podman build \
-  --build-arg PLUGIN_VERSION=0.1.0-pilot.2 \
+  --build-arg PLUGIN_VERSION=0.1.0-pilot.3 \
   -f Dockerfile.artifact \
-  -t paperclip-kubernetes-plugin:0.1.0-pilot.2 \
+  -t paperclip-kubernetes-plugin:0.1.0-pilot.3 \
   /tmp/paperclip-kubernetes-artifact
 ```
 
@@ -204,7 +211,7 @@ The Dockerfile defaults to a digest-pinned Alpine base image. The artifact build
 rejects an existing output path, verifies the exact runtime dependency
 versions, copies the committed npm lockfile into the payload, and confirms direct runtime
 dependencies are installed inside `/plugin/node_modules`. The plugin package
-and manifest use version `0.1.0-pilot.2`; the SDK dependency is pinned to
+and manifest use version `0.1.0-pilot.3`; the SDK dependency is pinned to
 `2026.916.1`, the SDK version deployed with the pilot server.
 
 To run the kind-cluster integration test (requires `kubectl --context kind-paperclip` and a pre-loaded alpine image; see `test/integration/end-to-end-run.test.ts`):

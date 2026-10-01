@@ -1,7 +1,7 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 
 const PLUGIN_ID = "paperclip.kubernetes-sandbox-provider";
-const PLUGIN_VERSION = "0.1.0-pilot.2";
+const PLUGIN_VERSION = "0.1.0-pilot.3";
 
 const manifest: PaperclipPluginManifestV1 = {
   id: PLUGIN_ID,
@@ -105,7 +105,12 @@ const manifest: PaperclipPluginManifestV1 = {
           podActivityDeadlineSec: {
             type: "integer",
             minimum: 1,
-            description: "Hard ceiling on a single run's wall-clock time (default: 3600).",
+            description: "Hard ceiling on a single exec/readiness wait and Job run (default: 3600). Does not set the Sandbox CR lease lifetime.",
+          },
+          sandboxLifetimeSec: {
+            type: "integer",
+            minimum: 1,
+            description: "Absolute Sandbox CR lease lifetime in seconds (default: 86400). The controller deletes the Sandbox and Pod at expiry, including during active work; resuming a lease does not extend it. Applies only to backend sandbox-cr.",
           },
           adapterType: {
             type: "string",

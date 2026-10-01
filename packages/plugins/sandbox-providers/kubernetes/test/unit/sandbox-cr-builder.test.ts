@@ -1,9 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { buildSandboxCrManifest } from "../../src/sandbox-cr-builder.js";
+import {
+  buildSandboxCrManifest,
+  resolveSandboxShutdownTime,
+} from "../../src/sandbox-cr-builder.js";
 
 const baseInput = {
   namespace: "paperclip-acme",
   sandboxName: "pc-01h00000000000000000000000",
+  shutdownTime: "2026-01-02T00:00:00.000Z",
   adapterType: "claude_local",
   image: "ghcr.io/paperclipai/agent-runtime-claude:v1",
   envSecretName: "pc-01h00000000000000000000000-env",
@@ -27,6 +31,12 @@ describe("buildSandboxCrManifest", () => {
     const cr = buildSandboxCrManifest(baseInput);
     expect(cr.metadata.name).toBe(baseInput.sandboxName);
     expect(cr.metadata.namespace).toBe(baseInput.namespace);
+  });
+
+  it("sets an absolute shutdown time and controller Delete policy", () => {
+    const cr = buildSandboxCrManifest(baseInput);
+    expect(cr.spec.shutdownTime).toBe(baseInput.shutdownTime);
+    expect(cr.spec.shutdownPolicy).toBe("Delete");
   });
 
   it("does NOT set ownerReferences (out-of-cluster server, explicit release path)", () => {
@@ -101,6 +111,15 @@ describe("buildSandboxCrManifest", () => {
     expect(envFrom[0].secretRef.name).toBe(baseInput.envSecretName);
   });
 
+  it("injects the actual Pod UID through the downward API", () => {
+    const cr = buildSandboxCrManifest(baseInput);
+    const env = cr.spec.podTemplate.spec.containers[0].env;
+    expect(env).toContainEqual({
+      name: "PAPERCLIP_SANDBOX_POD_UID",
+      valueFrom: { fieldRef: { fieldPath: "metadata.uid" } },
+    });
+  });
+
   it("applies runtimeClassName when set", () => {
     const cr = buildSandboxCrManifest({
       ...baseInput,
@@ -138,5 +157,42 @@ describe("buildSandboxCrManifest", () => {
   it("does not set imagePullSecrets when not provided", () => {
     const cr = buildSandboxCrManifest(baseInput);
     expect(cr.spec.podTemplate.spec.imagePullSecrets).toBeUndefined();
+  });
+});
+
+describe("resolveSandboxShutdownTime", () => {
+  const now = Date.parse("2026-01-01T00:00:00.000Z");
+
+  it("uses the configured absolute lifetime by default", () => {
+    expect(resolveSandboxShutdownTime(86_400, undefined, now)).toBe(
+      "2026-01-02T00:00:00.000Z",
+    );
+  });
+
+  it("honors an earlier requested expiry", () => {
+    expect(
+      resolveSandboxShutdownTime(86_400, "2026-01-01T01:00:00-04:00", now),
+    ).toBe("2026-01-01T05:00:00.000Z");
+  });
+
+  it("keeps the provider lifetime when the requested expiry is later", () => {
+    expect(
+      resolveSandboxShutdownTime(3_600, "2026-01-02T00:00:00Z", now),
+    ).toBe("2026-01-01T01:00:00.000Z");
+  });
+
+  it("rejects lifetimes outside the ISO date range", () => {
+    expect(() => resolveSandboxShutdownTime(Number.MAX_SAFE_INTEGER, undefined, now)).toThrow(
+      /invalid shutdownTime/,
+    );
+  });
+
+  it.each([
+    ["malformed", "not-a-timestamp"],
+    ["past", "2025-12-31T23:59:59Z"],
+  ])("rejects a %s requested expiry", (_label, requested) => {
+    expect(() => resolveSandboxShutdownTime(86_400, requested, now)).toThrow(
+      /requestedExpiresAt/,
+    );
   });
 });

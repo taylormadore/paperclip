@@ -19,9 +19,62 @@
 
 import { SANDBOX_API_VERSION } from "./sandbox-cr-api.js";
 
+function parseExplicitExpiry(value: string): number {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(value);
+  if (!match) {
+    throw new Error("requestedExpiresAt must be a valid ISO 8601 timestamp with a timezone");
+  }
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText, zone] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  const zoneOffset = zone === "Z" ? null : /^([+-])(\d{2}):(\d{2})$/.exec(zone);
+  if (
+    year === 0 || month < 1 || month > 12 || day < 1 || day > daysInMonth[month - 1] ||
+    hour > 23 || minute > 59 || second > 59 ||
+    (zoneOffset && (Number(zoneOffset[2]) > 23 || Number(zoneOffset[3]) > 59))
+  ) {
+    throw new Error("requestedExpiresAt must be a valid ISO 8601 timestamp with a timezone");
+  }
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new Error("requestedExpiresAt must be a valid ISO 8601 timestamp with a timezone");
+  }
+  return timestamp;
+}
+
+/** Resolve the CR's absolute shutdown deadline without ever extending a caller's deadline. */
+export function resolveSandboxShutdownTime(
+  lifetimeSeconds: number,
+  requestedExpiresAt?: string | null,
+  nowMs = Date.now(),
+): string {
+  if (!Number.isSafeInteger(lifetimeSeconds) || lifetimeSeconds <= 0) {
+    throw new Error("sandboxLifetimeSec must be a positive integer");
+  }
+  const providerDeadline = nowMs + lifetimeSeconds * 1000;
+  if (!Number.isFinite(new Date(providerDeadline).getTime())) {
+    throw new Error("sandboxLifetimeSec produces an invalid shutdownTime");
+  }
+  if (requestedExpiresAt === undefined || requestedExpiresAt === null) {
+    return new Date(providerDeadline).toISOString();
+  }
+  const requestedDeadline = parseExplicitExpiry(requestedExpiresAt);
+  if (requestedDeadline <= nowMs) {
+    throw new Error("requestedExpiresAt must be in the future");
+  }
+  return new Date(Math.min(providerDeadline, requestedDeadline)).toISOString();
+}
+
 export interface BuildSandboxCrManifestInput {
   namespace: string;
   sandboxName: string;
+  shutdownTime: string;
   adapterType: string;
   image: string;
   envSecretName: string;
@@ -55,6 +108,8 @@ export function buildSandboxCrManifest(
       // explicit delete.
     },
     spec: {
+      shutdownTime: input.shutdownTime,
+      shutdownPolicy: "Delete",
       podTemplate: {
         metadata: {
           labels: podLabels,
@@ -104,7 +159,13 @@ export function buildSandboxCrManifest(
                // HOME=/home/node is inside the readOnly root filesystem.
                // Claude (and most agent runtimes) silently exit with code 0
                // and no output when HOME is unwritable, so set this explicitly.
-              env: [{ name: "HOME", value: "/home/paperclip" }],
+              env: [
+                { name: "HOME", value: "/home/paperclip" },
+                {
+                  name: "PAPERCLIP_SANDBOX_POD_UID",
+                  valueFrom: { fieldRef: { fieldPath: "metadata.uid" } },
+                },
+              ],
               envFrom: [{ secretRef: { name: input.envSecretName } }],
               securityContext: {
                 runAsNonRoot: true,
